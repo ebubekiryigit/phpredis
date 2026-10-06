@@ -770,7 +770,8 @@ class Redis_Test extends TestSuite {
                 $this->redis->setOption(Redis::OPT_PREFIX, $testPrefix);
 
                 foreach (['mget', 'del', 'unlink'] as $command) {
-                    $keys = [101, 202, '{key-arguments}one', '{key-arguments}two'];
+                    $number = 101;
+                    $keys = [&$number, 202, '{key-arguments}one', '{key-arguments}two'];
                     $copy = $keys;
                     $values = ['first', 'second', 'third', 'fourth'];
 
@@ -782,6 +783,10 @@ class Redis_Test extends TestSuite {
                     $this->assertEquals($command === 'mget' ? $values : 4, $result);
                     $this->assertEquals([101, 202, '{key-arguments}one', '{key-arguments}two'], $keys);
                     $this->assertEquals($keys, $copy);
+                    $this->assertEquals(101, $number);
+                    $number = 303;
+                    $this->assertEquals(303, $keys[0]);
+                    $this->assertEquals(303, $copy[0]);
                 }
             }
         } finally {
