@@ -541,7 +541,7 @@ static int get_key_val_ht(redisCluster *c, HashTable *ht, HashPosition *ptr,
 
 /* Helper to pull, prefix, and hash a key from a HashTable value */
 static int get_key_ht(redisCluster *c, HashTable *ht, HashPosition *ptr,
-                      clusterKeyValHT *kv)
+                      clusterKeyValHT *kv, zend_string **key)
 {
     zval *z_key;
 
@@ -551,11 +551,15 @@ static int get_key_ht(redisCluster *c, HashTable *ht, HashPosition *ptr,
         return -1;
     }
 
-    // Always want to work with strings
-    convert_to_string(z_key);
+    /* Keep borrowed arguments intact and retain the key until it is packed. */
+    *key = zval_get_string(z_key);
+    if (UNEXPECTED(EG(exception))) {
+        zend_string_release(*key);
+        return -1;
+    }
 
-    kv->key = Z_STRVAL_P(z_key);
-    kv->key_len = Z_STRLEN_P(z_key);
+    kv->key = ZSTR_VAL(*key);
+    kv->key_len = ZSTR_LEN(*key);
     kv->key_free = redis_key_prefix(c->flags, &(kv->key), &(kv->key_len));
 
     // Hash our key
@@ -591,6 +595,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
     redisCluster *c = GET_CONTEXT();
     clusterMultiCmd mc = {0};
     clusterKeyValHT kv;
+    zend_string *key;
     zval *z_args;
     HashTable *ht_arr;
     HashPosition ptr;
@@ -629,7 +634,12 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
     // Process the first key outside of our loop, so we don't have to check if
     // it's the first iteration every time, needlessly
     zend_hash_internal_pointer_reset_ex(ht_arr, &ptr);
-    if (get_key_ht(c, ht_arr, &ptr, &kv) < 0) {
+    if (get_key_ht(c, ht_arr, &ptr, &kv, &key) < 0) {
+        cluster_multi_free(&mc);
+        if (ht_free) {
+            zend_hash_destroy(ht_arr);
+            efree(ht_arr);
+        }
         efree(z_args);
         return -1;
     }
@@ -639,6 +649,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
 
     // Free key if we prefixed
     if (kv.key_free) efree(kv.key);
+    zend_string_release(key);
 
     // Move to the next key
     zend_hash_move_forward_ex(ht_arr, &ptr);
@@ -646,7 +657,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
     // Iterate over keys 2...N
     slot = kv.slot;
     while (zend_hash_has_more_elements_ex(ht_arr, &ptr) ==SUCCESS) {
-        if (get_key_ht(c, ht_arr, &ptr, &kv) < 0) {
+        if (get_key_ht(c, ht_arr, &ptr, &kv, &key) < 0) {
             cluster_multi_free(&mc);
             if (ht_free) {
                 zend_hash_destroy(ht_arr);
@@ -662,6 +673,8 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
             if (distcmd_resp_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU, c, slot,
                                     &mc, z_ret, i == argc, cb) < 0)
             {
+                if (kv.key_free) efree(kv.key);
+                zend_string_release(key);
                 cluster_multi_free(&mc);
                 if (ht_free) {
                     zend_hash_destroy(ht_arr);
@@ -677,6 +690,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, char *kw, int kw_len,
 
         // Free key if we prefixed
         if (kv.key_free) efree(kv.key);
+        zend_string_release(key);
 
         // Update the last slot we encountered, and the key we're on
         slot = kv.slot;

@@ -70,6 +70,36 @@ class Redis_Cluster_Test extends Redis_Test {
     public function testSession_noUnlockOfOtherProcess() { $this->markTestSkipped(); }
     public function testSession_lockWaitTime() { $this->markTestSkipped(); }
 
+    public function testMultiKeyCommandsHandleKeyConversionErrors() {
+        $invalid = new class {
+            public function __toString() {
+                throw new RuntimeException('key conversion failed');
+            }
+        };
+
+        foreach (['mget', 'del', 'unlink'] as $command) {
+            foreach ([[$invalid], ['{key-arguments}first', $invalid]] as $keys) {
+                $exception = null;
+                try {
+                    if ($command === 'mget') {
+                        $this->redis->mget($keys);
+                    } else {
+                        $this->redis->$command(...$keys);
+                    }
+                } catch (RuntimeException $e) {
+                    $exception = $e;
+                }
+
+                $this->assertIsObject($exception, RuntimeException::class);
+                $this->assertEquals('key conversion failed', $exception->getMessage());
+                $this->assertTrue($keys[count($keys) - 1] === $invalid);
+                $this->assertTrue($this->redis->set('{key-arguments}after', 'clean'));
+                $this->assertEquals('clean', $this->redis->get('{key-arguments}after'));
+            }
+        }
+        $this->redis->del('{key-arguments}after');
+    }
+
     /* Regression test for GH #2810 */
     public function testConstructNullSeeds() {
         /* new RedisCluster(null, null) must not throw TypeError.
