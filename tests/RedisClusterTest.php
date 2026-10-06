@@ -169,7 +169,7 @@ class Redis_Cluster_Test extends Redis_Test {
         set_error_handler(function ($severity, $message) use (&$warning) {
             $warning = $message;
             return true;
-        }, E_WARNING);
+        }, E_WARNING | E_NOTICE);
 
         try {
             foreach (['mget', 'del', 'unlink'] as $command) {
