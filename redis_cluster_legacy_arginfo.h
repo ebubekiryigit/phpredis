@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 33a08977b441f800b3f3f775eaff010a3298794b */
+ * Stub hash: fd4b570c8467ca13de1367e2fb934a4c038c40c4 */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_RedisCluster___construct, 0, 0, 1)
 	ZEND_ARG_INFO(0, name)
@@ -1693,6 +1693,12 @@ static zend_class_entry *register_class_RedisCluster(void)
 	zend_string *const_FAILOVER_DISTRIBUTE_SLAVES_name = zend_string_init_interned("FAILOVER_DISTRIBUTE_SLAVES", sizeof("FAILOVER_DISTRIBUTE_SLAVES") - 1, 1);
 	zend_declare_class_constant_ex(class_entry, const_FAILOVER_DISTRIBUTE_SLAVES_name, &const_FAILOVER_DISTRIBUTE_SLAVES_value, ZEND_ACC_PUBLIC, NULL);
 	zend_string_release(const_FAILOVER_DISTRIBUTE_SLAVES_name);
+
+	zval const_OPT_PIPELINE_FOLLOW_REDIRECTS_value;
+	ZVAL_LONG(&const_OPT_PIPELINE_FOLLOW_REDIRECTS_value, REDIS_OPT_PIPELINE_FOLLOW_REDIRECTS);
+	zend_string *const_OPT_PIPELINE_FOLLOW_REDIRECTS_name = zend_string_init_interned("OPT_PIPELINE_FOLLOW_REDIRECTS", sizeof("OPT_PIPELINE_FOLLOW_REDIRECTS") - 1, 1);
+	zend_declare_class_constant_ex(class_entry, const_OPT_PIPELINE_FOLLOW_REDIRECTS_name, &const_OPT_PIPELINE_FOLLOW_REDIRECTS_value, ZEND_ACC_PUBLIC, NULL);
+	zend_string_release(const_OPT_PIPELINE_FOLLOW_REDIRECTS_name);
 
 	return class_entry;
 }

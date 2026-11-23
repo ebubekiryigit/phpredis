@@ -81,6 +81,8 @@ void redis_cmd_reset(RedisCmd *cmd, const char *kw, size_t kwlen) {
     cmd->head = NULL;
     cmd->slot = -1;
     cmd->slot_is_random = 0;
+    cmd->nkeys = 0;
+    cmd->key_bits = 0;
 
     smart_string_appendl_ex(&cmd->s, ZEND_STRL(REDIS_MB_HDR), 0);
     redis_cmd_cat_str(cmd, kw, kwlen);
@@ -159,12 +161,31 @@ void redis_cmd_cat_arrkey(RedisCmd *cmd, zend_string *str, zend_ulong idx) {
     }
 }
 
+void redis_cmd_note_key(RedisCmd *cmd, const char *key, size_t keylen) {
+    zend_ulong h = zend_inline_hash_func(key, keylen);
+    uint64_t mix = h;
+
+    if (cmd->nkeys < REDIS_CMD_KEY_HASHES)
+        cmd->key_hashes[cmd->nkeys] = h;
+    cmd->nkeys++;
+
+    /* Spread the hash before taking one of 64 bits from its top */
+    mix ^= mix >> 31;
+    mix *= UINT64_C(0x9e3779b97f4a7c15);
+    cmd->key_bits |= UINT64_C(1) << (mix >> 58);
+}
+
 static inline zend_bool
 update_slot(RedisCmd *cmd, const char *key, size_t keylen) {
     short slot;
 
     if (cmd->redis_sock == NULL || cmd->redis_sock->type != REDIS_SOCK_CLUSTER)
         return 1;
+
+    /* Only a pipeline that follows redirects orders them by key */
+    if (cmd->redis_sock->note_keys) {
+        redis_cmd_note_key(cmd, key, keylen);
+    }
 
     slot = cluster_hash_key(key, keylen);
 

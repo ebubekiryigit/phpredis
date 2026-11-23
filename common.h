@@ -146,6 +146,7 @@ typedef enum _PUBSUB_TYPE {
 #define REDIS_OPT_BACKOFF_BASE        13
 #define REDIS_OPT_BACKOFF_CAP         14
 #define REDIS_OPT_PACK_IGNORE_NUMBERS 15
+#define REDIS_OPT_PIPELINE_FOLLOW_REDIRECTS 16
 
 /* cluster options */
 #define REDIS_FAILOVER_NONE              0
@@ -296,6 +297,9 @@ typedef struct {
     size_t              txBytes;
     size_t              rxBytes;
     uint8_t             flags;
+    /* Command builders note the keys they append (see RedisCmd), for a
+     * cluster pipeline that follows redirects */
+    zend_bool           note_keys;
 } RedisSock;
 /* }}} */
 

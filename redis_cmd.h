@@ -6,6 +6,9 @@
 
 #include "common.h"
 
+/* Keys whose hashes a command keeps; more are only known by their bits */
+#define REDIS_CMD_KEY_HASHES 4
+
 typedef struct RedisCmd {
     RedisSock *redis_sock;
     short slot;
@@ -14,6 +17,13 @@ typedef struct RedisCmd {
     RedisCmdCtx ctx;
     uint32_t argc;
     char *head;
+
+    /* The keys a pipelined cluster command names, so redirected commands can
+     * be kept in order per key: their number, the hashes of the first few,
+     * and a 64 bit filter with one bit per key. */
+    uint32_t nkeys;
+    zend_ulong key_hashes[REDIS_CMD_KEY_HASHES];
+    uint64_t key_bits;
 } RedisCmd;
 
 #define redis_cmd_create_literal(redis_sock, kw) \
@@ -85,6 +95,7 @@ redis_cmd_set_ctx_u64(RedisCmd *cmd, uint64_t u64) {
 }
 
 void redis_cmd_randslot(RedisCmd *cmd);
+void redis_cmd_note_key(RedisCmd *cmd, const char *key, size_t keylen);
 
 static zend_always_inline zend_bool
 redis_cmd_slot_is_random(const RedisCmd *cmd) {

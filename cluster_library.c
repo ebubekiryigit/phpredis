@@ -973,6 +973,7 @@ PHP_REDIS_API void cluster_free_queue(redisCluster *c)
     while (item) {
         next = item->next;
         redis_cmd_ctx_free(item->ctx);
+        if (item->follow) efree(item->follow);
         efree(item);
         item = next;
     }
@@ -996,6 +997,11 @@ cluster_free(redisCluster *c, int free_ctx)
      * pipelined MULTI buffer must also be released before destruction. */
     if (redis_sock_is_pipeline(c->flags)) {
         smart_string_free(&c->pipeline_multi_cmd);
+    }
+    cluster_pipeline_free_sent(c);
+    if (Z_TYPE(c->pipeline_outer) != IS_UNDEF) {
+        zval_ptr_dtor(&c->pipeline_outer);
+        ZVAL_UNDEF(&c->pipeline_outer);
     }
     redis_sock_free_auth(c->flags);
     redis_sock_free_context(c->flags);
@@ -3110,16 +3116,60 @@ static void cluster_pipeline_redirection_error(redisCluster *c)
     }
 }
 
-static int cluster_pipeline_read_item(redisCluster *c, clusterFoldItem *fi)
+/* Returned for a MOVED or ASK reply the caller follows */
+#define CLUSTER_PIPELINE_REDIRECTED 1
+
+PHP_REDIS_API void cluster_pipeline_keep_sent(redisCluster *c, RedisSock *sock,
+                                              const smart_string *buf)
+{
+    c->pipeline_sent = safe_erealloc(c->pipeline_sent,
+                                     c->pipeline_sent_count + 1,
+                                     sizeof(*c->pipeline_sent), 0);
+    c->pipeline_sent[c->pipeline_sent_count].sock = sock;
+    c->pipeline_sent[c->pipeline_sent_count].buf = *buf;
+    c->pipeline_sent_count++;
+}
+
+PHP_REDIS_API void cluster_pipeline_free_sent(redisCluster *c)
+{
+    uint32_t i;
+
+    for (i = 0; i < c->pipeline_sent_count; i++) {
+        smart_string_free(&c->pipeline_sent[i].buf);
+    }
+    if (c->pipeline_sent) efree(c->pipeline_sent);
+
+    c->pipeline_sent = NULL;
+    c->pipeline_sent_count = 0;
+}
+
+static const smart_string *
+cluster_pipeline_sent_buf(const redisCluster *c, const RedisSock *sock)
+{
+    uint32_t i;
+
+    for (i = 0; i < c->pipeline_sent_count; i++) {
+        if (c->pipeline_sent[i].sock == sock) {
+            return &c->pipeline_sent[i].buf;
+        }
+    }
+
+    return NULL;
+}
+
+/* Read the reply header of fi from sock.  With follow set, a MOVED or ASK
+ * reply returns CLUSTER_PIPELINE_REDIRECTED instead of failing. */
+static int cluster_pipeline_read_reply(redisCluster *c, clusterFoldItem *fi,
+                                       RedisSock *sock, zend_bool follow)
 {
     int resp;
 
-    if (fi == NULL || fi->sock == NULL) {
+    if (fi == NULL || sock == NULL) {
         return FAILURE;
     }
 
     c->cmd_slot = fi->slot;
-    c->cmd_sock = fi->sock;
+    c->cmd_sock = sock;
 
     resp = cluster_check_response(c, &c->reply_type);
     if (resp < 0) {
@@ -3145,6 +3195,9 @@ static int cluster_pipeline_read_item(redisCluster *c, clusterFoldItem *fi)
             c->pipeline_refresh_slots = 1;
             cluster_cache_clear(c);
         }
+        if (follow) {
+            return CLUSTER_PIPELINE_REDIRECTED;
+        }
         cluster_pipeline_redirection_error(c);
         return FAILURE;
     }
@@ -3152,18 +3205,52 @@ static int cluster_pipeline_read_item(redisCluster *c, clusterFoldItem *fi)
     return SUCCESS;
 }
 
+static int cluster_pipeline_read_item(redisCluster *c, clusterFoldItem *fi)
+{
+    return cluster_pipeline_read_reply(c, fi, fi ? fi->sock : NULL, 0);
+}
+
+/* Whether a redirected command is sent on rather than aborting the pipeline:
+ * the pipeline was opened with OPT_PIPELINE_FOLLOW_REDIRECTS, the command's
+ * bytes are known (it is not in a MULTI block) and so are its keys, and if
+ * it is part of a distributed command, it is the last part, whose reply is
+ * read after the others. */
+static zend_bool cluster_pipeline_can_follow(const redisCluster *c,
+                                             const clusterFoldItem *fi)
+{
+    return c->pipeline_following && fi->follow->cmd_len > 0 &&
+           fi->follow->nkeys != CLUSTER_KEYS_UNKNOWN &&
+           (!fi->fold_errors || ((const clusterMultiCtx *)fi->ctx.ptr)->last);
+}
+
+static void cluster_pipeline_note_redirect(redisCluster *c, clusterFoldItem *fi)
+{
+    fi->follow->redir_type = c->redir_type;
+    fi->follow->redir_node = cluster_get_asking_node(c);
+    c->pipeline_redirected++;
+}
+
 static int cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAMETERS,
-                                   redisCluster *c, clusterFoldItem *fi)
+                                   redisCluster *c, clusterFoldItem *fi,
+                                   RedisSock *sock, zend_bool follow)
 {
     zend_bool failed;
     uint8_t flags = c->flags->flags;
+    int ret;
 
     if (fi->callback == NULL) {
         return FAILURE;
     }
 
-    if (cluster_pipeline_read_item(c, fi) == FAILURE) {
-        return FAILURE;
+    if ((ret = cluster_pipeline_read_reply(c, fi, sock, follow)) != SUCCESS) {
+        return ret;
+    }
+
+    /* A command answered with TRYAGAIN did not run */
+    if (fi->follow) {
+        fi->follow->tryagain = c->err != NULL &&
+            ZSTR_LEN(c->err) >= sizeof("TRYAGAIN") - 1 &&
+            memcmp(ZSTR_VAL(c->err), "TRYAGAIN", sizeof("TRYAGAIN") - 1) == 0;
     }
 
     if (c->err != NULL && !fi->fold_errors) {
@@ -3241,7 +3328,9 @@ static int cluster_pipeline_transaction_resp(INTERNAL_FUNCTION_PARAMETERS,
     array_init(&c->multi_resp);
 
     for (fi = first; fi != exec; fi = fi->next) {
-        if (cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAM_PASSTHRU, c, fi) == FAILURE) {
+        if (cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAM_PASSTHRU, c, fi,
+                                    fi->sock, 0) != SUCCESS)
+        {
             zval_ptr_dtor_nogc(&c->multi_resp);
             ZVAL_COPY_VALUE(&c->multi_resp, &outer);
             return FAILURE;
@@ -3256,20 +3345,297 @@ static int cluster_pipeline_transaction_resp(INTERNAL_FUNCTION_PARAMETERS,
     return SUCCESS;
 }
 
+/* What one pass redirected in a slot: the node its commands go to next, the
+ * bits of all their keys, and the bits of those whose keys are not all known
+ * by hash */
+typedef struct clusterRedirectedSlot {
+    redisClusterNode *target;
+    uint64_t key_bits;
+    uint64_t inexact_key_bits;
+} clusterRedirectedSlot;
+
+static void cluster_free_redirected_slot(zval *zv)
+{
+    efree(Z_PTR_P(zv));
+}
+
+/* Whether all of a command's keys are known by their hashes */
+static zend_always_inline zend_bool
+cluster_keys_exact(const clusterFollowItem *f)
+{
+    return f->nkeys <= REDIS_CMD_KEY_HASHES;
+}
+
+/* Whether the commands one pass saw redirected can be sent on without
+ * changing the order of the commands on any key: no command that ran in the
+ * pass may share a key with an earlier command of the pass that was
+ * redirected, and all redirected commands of a slot must go to one node,
+ * which runs them in their order.  A command answered with TRYAGAIN did not
+ * run.  The keys are those the command builders name: exactly by hash up to
+ * REDIS_CMD_KEY_HASHES keys, by one bit of 64 per key beyond.  A command
+ * whose keys are unknown may have used any key its node holds, so it must
+ * not run after any redirected command of the pass.  A key a script uses
+ * without declaring it is not seen. */
+static zend_bool cluster_pipeline_redirects_ordered(const redisCluster *c,
+                                                    uint8_t pass)
+{
+    zend_bool ordered = 1, redirected = 0;
+    const clusterFollowItem *f;
+    clusterRedirectedSlot *rs;
+    const clusterFoldItem *fi;
+    HashTable slots, keys;
+    uint32_t i;
+
+    /* Sized by what the pass redirected, not by the slot count */
+    zend_hash_init(&slots, 8, NULL, cluster_free_redirected_slot, 0);
+    zend_hash_init(&keys, 8, NULL, NULL, 0);
+
+    for (fi = c->multi_head; fi && ordered; fi = fi->next) {
+        f = fi->follow;
+
+        /* Not sent in this pass */
+        if (f->pass != pass || fi->sock == NULL)
+            continue;
+
+        if (f->redir_type == REDIR_NONE) {
+            /* Naming no key, or not run */
+            if (f->nkeys == 0 || f->tryagain)
+                continue;
+            /* Run, so it must not share a key with a pending command */
+            if (f->nkeys == CLUSTER_KEYS_UNKNOWN) {
+                ordered = !redirected;
+                continue;
+            }
+            if ((rs = zend_hash_index_find_ptr(&slots, fi->slot)) == NULL)
+                continue;
+            if (!cluster_keys_exact(f)) {
+                ordered = (rs->key_bits & f->key_bits) == 0;
+                continue;
+            }
+            ordered = (rs->inexact_key_bits & f->key_bits) == 0;
+            for (i = 0; ordered && i < f->nkeys; i++) {
+                ordered = !zend_hash_index_exists(&keys, f->key_hashes[i]);
+            }
+            continue;
+        }
+
+        redirected = 1;
+
+        if ((rs = zend_hash_index_find_ptr(&slots, fi->slot)) == NULL) {
+            rs = ecalloc(1, sizeof(*rs));
+            rs->target = f->redir_node;
+            zend_hash_index_add_new_ptr(&slots, fi->slot, rs);
+        } else if (rs->target != f->redir_node) {
+            ordered = 0;
+        }
+
+        rs->key_bits |= f->key_bits;
+        if (!cluster_keys_exact(f)) {
+            rs->inexact_key_bits |= f->key_bits;
+            continue;
+        }
+        for (i = 0; i < f->nkeys; i++) {
+            zend_hash_index_add_empty_element(&keys, f->key_hashes[i]);
+        }
+    }
+
+    zend_hash_destroy(&slots);
+    zend_hash_destroy(&keys);
+
+    return ordered;
+}
+
+/* The +OK reply to ASKING */
+static int cluster_pipeline_read_asking(redisCluster *c, RedisSock *sock)
+{
+    int resp;
+
+    c->cmd_sock = sock;
+    resp = cluster_check_response(c, &c->reply_type);
+
+    if (resp == 0 && c->reply_type == TYPE_LINE)
+        return SUCCESS;
+
+    c->pipeline_refresh_slots = 1;
+    cluster_cache_clear(c);
+
+    /* A broken connection gets exec()'s message for a failed read */
+    if (resp >= 0 && !EG(exception)) {
+        CLUSTER_THROW_EXCEPTION(c->clusterdown
+            ? "The Redis Cluster is down (CLUSTERDOWN)"
+            : "Unexpected reply to ASKING in a pipeline", 0);
+    }
+
+    return FAILURE;
+}
+
+/* Decode a followed command's reply into the place kept for it */
+static int cluster_pipeline_invoke_at(INTERNAL_FUNCTION_PARAMETERS,
+                                      redisCluster *c, clusterFoldItem *fi,
+                                      RedisSock *sock)
+{
+    zval *reply;
+    int ret;
+
+    /* The result waits in the cluster struct while the reply is decoded into
+     * a scratch array, so that cluster_free() releases it after a bailout */
+    ZVAL_COPY_VALUE(&c->pipeline_outer, &c->multi_resp);
+    array_init(&c->multi_resp);
+
+    ret = cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAM_PASSTHRU, c, fi,
+                                  sock, 1);
+    if (ret == SUCCESS) {
+        if (zend_hash_num_elements(Z_ARRVAL(c->multi_resp)) != 1 ||
+            (reply = zend_hash_index_find(Z_ARRVAL(c->multi_resp), 0)) == NULL)
+        {
+            ret = FAILURE;
+        } else {
+            /* Moved, not copied, so no reference count changes */
+            zend_hash_index_update(Z_ARRVAL(c->pipeline_outer), fi->follow->reply_idx,
+                                   reply);
+            ZVAL_NULL(reply);
+        }
+    }
+
+    zval_ptr_dtor_nogc(&c->multi_resp);
+    ZVAL_COPY_VALUE(&c->multi_resp, &c->pipeline_outer);
+    ZVAL_UNDEF(&c->pipeline_outer);
+
+    return ret;
+}
+
+/* Send the commands the last pass saw redirected to the nodes their MOVED or
+ * ASK replies named (ASK ones after ASKING), and decode their replies into
+ * the places kept for them.  Such a reply means the node did not run the
+ * command, so sending it again does not run it twice. */
+static int cluster_pipeline_follow(INTERNAL_FUNCTION_PARAMETERS,
+                                   redisCluster *c)
+{
+    clusterFoldItem *fi, *last = c->multi_curr;
+    zend_string *last_err = NULL;
+    const smart_string *sent;
+    smart_string buf;
+    RedisSock *sock;
+    uint8_t pass;
+    int ret;
+
+    /* getLastError() keeps describing the reply to the pipeline's last
+     * command, whichever pass read it */
+    if (last->follow->redir_type == REDIR_NONE && c->err)
+        last_err = zend_string_copy(c->err);
+
+    for (pass = 0; c->pipeline_redirected > 0; pass++) {
+        if (pass == CLUSTER_PIPELINE_MAX_REDIRECTS) {
+            if (!EG(exception)) {
+                CLUSTER_THROW_EXCEPTION(
+                    "Pipelined commands were redirected too many times, aborting pipeline", 0);
+            }
+            goto fail;
+        }
+        if (!cluster_pipeline_redirects_ordered(c, pass)) {
+            cluster_pipeline_redirection_error(c);
+            goto fail;
+        }
+
+        /* Queue each command on its node, in command order */
+        for (fi = c->multi_head; fi; fi = fi->next) {
+            if (fi->follow->pass != pass || fi->follow->redir_type == REDIR_NONE)
+                continue;
+
+            sent = cluster_pipeline_sent_buf(c, fi->sock);
+            if (sent == NULL || fi->follow->cmd_off + fi->follow->cmd_len > sent->len)
+                goto fail;
+
+            sock = fi->follow->redir_node->sock;
+            if (fi->follow->redir_type == REDIR_ASK) {
+                smart_string_appendl(&sock->pipeline_cmd, RESP_ASKING_CMD,
+                                     sizeof(RESP_ASKING_CMD) - 1);
+            }
+            smart_string_appendl(&sock->pipeline_cmd, sent->c + fi->follow->cmd_off,
+                                 fi->follow->cmd_len);
+            fi->follow->pass = pass + 1;
+        }
+
+        /* One write per node; detaching a buffer skips its later commands */
+        for (fi = c->multi_head; fi; fi = fi->next) {
+            if (fi->follow->pass != pass + 1 || fi->follow->redir_node->sock->pipeline_cmd.len == 0)
+                continue;
+
+            sock = fi->follow->redir_node->sock;
+            buf = sock->pipeline_cmd;
+            memset(&sock->pipeline_cmd, 0, sizeof(sock->pipeline_cmd));
+
+            ret = cluster_send_pipeline(c, sock, buf.c, buf.len);
+            smart_string_free(&buf);
+            if (ret < 0) {
+                c->pipeline_refresh_slots = 1;
+                cluster_cache_clear(c);
+                if (!EG(exception)) {
+                    CLUSTER_THROW_EXCEPTION("Unable to send pipeline to node", 0);
+                }
+                goto fail;
+            }
+        }
+
+        /* Replies, in command order */
+        c->pipeline_redirected = 0;
+        for (fi = c->multi_head; fi; fi = fi->next) {
+            if (fi->follow->pass != pass + 1)
+                continue;
+
+            sock = fi->follow->redir_node->sock;
+            if (fi->follow->redir_type == REDIR_ASK &&
+                cluster_pipeline_read_asking(c, sock) == FAILURE)
+            {
+                goto fail;
+            }
+
+            fi->follow->redir_type = REDIR_NONE;
+            ret = cluster_pipeline_invoke_at(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                                             c, fi, sock);
+            if (ret == CLUSTER_PIPELINE_REDIRECTED) {
+                cluster_pipeline_note_redirect(c, fi);
+            } else if (ret != SUCCESS) {
+                goto fail;
+            } else if (fi == last) {
+                if (last_err) zend_string_release(last_err);
+                last_err = c->err ? zend_string_copy(c->err) : NULL;
+            }
+        }
+    }
+
+    if (c->err) zend_string_release(c->err);
+    c->err = last_err;
+
+    return SUCCESS;
+
+fail:
+    if (last_err) zend_string_release(last_err);
+    return FAILURE;
+}
+
 /* Read pipeline responses in the original command order. */
 PHP_REDIS_API int cluster_pipeline_resp(INTERNAL_FUNCTION_PARAMETERS,
                                         redisCluster *c)
 {
     clusterFoldItem *fi = c->multi_head;
+    int ret;
 
     array_init(&c->multi_resp);
 
     while (fi) {
         switch (fi->type) {
             case CLUSTER_FOLD_RESPONSE:
-                if (cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAM_PASSTHRU,
-                                            c, fi) == FAILURE)
-                {
+                ret = cluster_pipeline_invoke(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                                              c, fi, fi->sock,
+                                              cluster_pipeline_can_follow(c, fi));
+                if (ret == CLUSTER_PIPELINE_REDIRECTED) {
+                    /* Its reply takes this place once it has been followed;
+                     * the result is a list, so its size is the next index */
+                    fi->follow->reply_idx = zend_hash_num_elements(Z_ARRVAL(c->multi_resp));
+                    add_next_index_null(&c->multi_resp);
+                    cluster_pipeline_note_redirect(c, fi);
+                } else if (ret != SUCCESS) {
                     goto fail;
                 }
                 fi = fi->next;
@@ -3292,6 +3658,12 @@ PHP_REDIS_API int cluster_pipeline_resp(INTERNAL_FUNCTION_PARAMETERS,
             default:
                 goto fail;
         }
+    }
+
+    if (c->pipeline_redirected > 0 &&
+        cluster_pipeline_follow(INTERNAL_FUNCTION_PARAM_PASSTHRU, c) == FAILURE)
+    {
+        goto fail;
     }
 
     return SUCCESS;
