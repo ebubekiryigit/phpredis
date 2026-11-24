@@ -2828,15 +2828,37 @@ PHP_METHOD(RedisCluster, discard) {
     RETURN_TRUE;
 }
 
+/* Directed commands treat any of these scalars as a key */
+static zend_always_inline zend_bool
+cluster_cmd_arg_is_key(const zval *z_arg)
+{
+    return Z_TYPE_P(z_arg) == IS_STRING || Z_TYPE_P(z_arg) == IS_LONG ||
+           Z_TYPE_P(z_arg) == IS_DOUBLE;
+}
+
+/* Hash a directed command's key argument, prefixed like any other key */
+static short
+cluster_cmd_key_slot(const redisCluster *c, zval *z_arg)
+{
+    zend_string *zstr = zval_get_string(z_arg);
+    char *key = ZSTR_VAL(zstr);
+    size_t key_len = ZSTR_LEN(zstr);
+    short slot;
+
+    const int key_free = redis_key_prefix(c->flags, &key, &key_len);
+    slot = cluster_hash_key(key, key_len);
+    zend_string_release(zstr);
+    if (key_free) efree(key);
+
+    return slot;
+}
+
 /* Get a slot either by key (string) or host/port array */
 static short
 cluster_cmd_get_slot(const redisCluster *c, zval *z_arg)
 {
-    size_t key_len;
     const zval *z_host, *z_port;
     short slot;
-    char *key;
-    zend_string *zstr;
 
     if (redis_sock_is_pipeline(c->flags)) {
         CLUSTER_THROW_EXCEPTION(
@@ -2846,19 +2868,8 @@ cluster_cmd_get_slot(const redisCluster *c, zval *z_arg)
 
     /* If it's a string, treat it as a key.  Otherwise, look for a two
      * element array */
-    if (Z_TYPE_P(z_arg) ==IS_STRING || Z_TYPE_P(z_arg) ==IS_LONG ||
-       Z_TYPE_P(z_arg) ==IS_DOUBLE)
-    {
-        /* Allow for any scalar here */
-        zstr = zval_get_string(z_arg);
-        key = ZSTR_VAL(zstr);
-        key_len = ZSTR_LEN(zstr);
-
-        /* Hash it */
-        const int key_free = redis_key_prefix(c->flags, &key, &key_len);
-        slot = cluster_hash_key(key, key_len);
-        zend_string_release(zstr);
-        if (key_free) efree(key);
+    if (cluster_cmd_arg_is_key(z_arg)) {
+        slot = cluster_cmd_key_slot(c, z_arg);
     } else if (Z_TYPE_P(z_arg) == IS_ARRAY &&
         (z_host = zend_hash_index_find(Z_ARRVAL_P(z_arg), 0)) != NULL &&
         (z_port = zend_hash_index_find(Z_ARRVAL_P(z_arg), 1)) != NULL &&
@@ -3960,9 +3971,30 @@ PHP_METHOD(RedisCluster, rawcommand) {
             "Internal PHP error parsing method parameters.");
         efree(z_args);
         RETURN_FALSE;
-    } else if ((cmd = redis_build_raw_cmd(&z_args[1], argc-1)) == NULL ||
-               (cmd->slot = cluster_cmd_get_slot(c, &z_args[0])) < 0)
-    {
+    } else if ((cmd = redis_build_raw_cmd(&z_args[1], argc-1)) == NULL) {
+        efree(z_args);
+        RETURN_FALSE;
+    }
+
+    /* A key routes the command like any keyed command, so it can be queued,
+     * and its reply is decoded as in ATOMIC mode.  As there, the command is
+     * sent as given.  A [host, port] node is refused by cluster_cmd_get_slot()
+     * below. */
+    if (redis_sock_is_pipeline(c->flags) && cluster_cmd_arg_is_key(&z_args[0])) {
+        cmd->slot = cluster_cmd_key_slot(c, &z_args[0]);
+        efree(z_args);
+
+        if (cluster_pipeline_enqueue(c, cmd->slot, cmd, cluster_variant_raw_resp,
+                                     0, redis_empty_ctx) < 0)
+        {
+            redis_cmd_free(cmd);
+            RETURN_FALSE;
+        }
+        redis_cmd_free(cmd);
+        RETURN_ZVAL(getThis(), 1, 0);
+    }
+
+    if ((cmd->slot = cluster_cmd_get_slot(c, &z_args[0])) < 0) {
         redis_cmd_free(cmd);
         efree(z_args);
         RETURN_FALSE;

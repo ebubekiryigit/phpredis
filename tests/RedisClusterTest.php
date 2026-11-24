@@ -1768,6 +1768,99 @@ class Redis_Cluster_Test extends Redis_Test {
         $this->assertEquals([true, 'queued'], $pipe->get($key)->exec());
     }
 
+    private function rawCommandsByKey($redis, $a, $b, $stream, $routed, $prefix) {
+        return [
+            $redis->rawCommand($a, 'SET', "$prefix$a", 'raw-a'),
+            $redis->rawCommand($routed, 'SET', "$prefix$routed", 'routed'),
+            $redis->get($routed),
+            $redis->set($b, 'typed-b'),
+            $redis->rawCommand($b, 'GET', "$prefix$b"),
+            $redis->get($a),
+            $redis->rawCommand($a, 'HGET', "$prefix$a", 'field'),
+            $redis->rawCommand($stream, 'XADD', "$prefix$stream", '1-1', 'f', 'v'),
+            $redis->rawCommand($stream, 'XRANGE', "$prefix$stream", '-', '+'),
+            $redis->rawCommand($b, 'HSET', "$prefix$b:hash", 'f', 1),
+            $redis->rawCommand($stream, 'GET', "$prefix$stream:missing"),
+            $redis->rawCommand($a, 'PING'),
+        ];
+    }
+
+    public function testPipelineRawCommandByKey() {
+        [$a, $b] = $this->keysOnDistinctMasters('pipe-raw');
+        $stream = '{pipe-raw}stream';
+        $expected = [true, true, 'routed', true, 'typed-b', 'raw-a', false,
+                     '1-1', [['1-1', ['f', 'v']]], 1, null, true];
+
+        /* A key without a hash tag whose prefixed name lives on another
+         * master, so routing by the bare name would be redirected. */
+        for ($i = 0; $i < 256; $i++) {
+            $routed = "pipe-raw-routed-$i";
+            if ($this->redis->cluster($routed, 'MYID') !==
+                $this->redis->cluster("pipe-raw-prefix:$routed", 'MYID'))
+            {
+                break;
+            }
+        }
+
+        try {
+            foreach (['', 'pipe-raw-prefix:'] as $prefix) {
+                $this->redis->setOption(Redis::OPT_PREFIX, $prefix);
+                $keys = [$a, $b, "$b:hash", $stream, $routed];
+
+                /* The raw arguments are sent as given, so the key form must
+                 * route by the prefixed key just as a typed command does. */
+                $this->redis->del($keys);
+                $atomic = $this->rawCommandsByKey($this->redis, $a, $b, $stream, $routed, $prefix);
+                $this->assertEquals($expected, $atomic);
+
+                $this->redis->del($keys);
+                $pipe = $this->redis->pipeline();
+                foreach ($this->rawCommandsByKey($pipe, $a, $b, $stream, $routed, $prefix) as $queued) {
+                    $this->assertEquals($pipe, $queued);
+                }
+                $this->assertEquals($atomic, $pipe->exec());
+                $this->assertEquals(Redis::ATOMIC, $this->redis->getMode());
+                $this->redis->del($keys);
+            }
+
+            $this->redis->setOption(Redis::OPT_PREFIX, '');
+            $ret = $this->redis->pipeline()
+                ->multi()
+                ->rawCommand($stream, 'SET', $stream, '1')
+                ->rawCommand($stream, 'INCRBY', $stream, 41)
+                ->exec()
+                ->rawCommand($stream, 'GET', $stream)
+                ->exec();
+            $this->assertEquals([[true, 42], '42'], $ret);
+        } finally {
+            $this->redis->setOption(Redis::OPT_PREFIX, '');
+            $this->redis->del([$a, $b, "$b:hash", $stream, $routed]);
+        }
+    }
+
+    public function testPipelineRawCommandRejectionsPreserveQueuedState() {
+        $key = '{pipe-raw-reject}key';
+        $master = $this->redis->_masters()[0];
+        /* Only a key can be queued: a node, or anything that is not a key */
+        $targets = ['node' => $master, 'host only' => [$master[0]],
+                    'null' => null, 'bool' => true];
+
+        foreach ($targets as $name => $target) {
+            $pipe = $this->redis->pipeline()->set($key, $name);
+            $exception = null;
+            try {
+                $pipe->rawCommand($target, 'GET', $key);
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertEquals(Redis::PIPELINE, $pipe->getMode());
+            $this->assertEquals([true, $name], $pipe->get($key)->exec());
+        }
+
+        $this->redis->del($key);
+    }
+
     public function testPipelineCrossSlotMset() {
         $values = ['{pipeA}one' => '1', '{pipeB}two' => '2'];
 
@@ -2348,6 +2441,7 @@ class Redis_Cluster_Test extends Redis_Test {
     public function testPipelineRemainingDirectedCommandsPreserveQueuedState() {
         $key = '{pipe-directed-matrix}key';
         $control = '{pipe-directed-matrix}control';
+        $master = $this->redis->_masters()[0];
         $this->redis->set($control, 'unchanged');
         $commands = [
             ['save', [$key]], ['bgsave', [$key]], ['bgrewriteaof', [$key]],
@@ -2356,7 +2450,7 @@ class Redis_Cluster_Test extends Redis_Test {
             ['config', [$key, 'GET', 'maxmemory']], ['pubsub', [$key, 'CHANNELS']],
             ['slowlog', [$key, 'LEN']], ['role', [$key]], ['time', [$key]],
             ['randomkey', [$key]], ['echo', [$key, 'echo']],
-            ['rawCommand', [$key, 'GET', $key]], ['acl', [$key, 'WHOAMI']],
+            ['rawCommand', [$master, 'GET', $key]], ['acl', [$key, 'WHOAMI']],
             ['cluster', [$key, 'KEYSLOT', $key]],
             ['script', [$key, 'EXISTS', str_repeat('0', 40)]],
         ];

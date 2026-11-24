@@ -162,8 +162,16 @@ Pipelines are not retried after connection failures, MOVED/ASK redirections, or
 connections are closed instead, and a redirect aborts the entire pipeline.
 After a topology or connection failure, routing is refreshed before the next
 pipeline starts; commands from the failed pipeline are never replayed.
-Node-directed commands, `rawCommand`, `WAIT`, `WAITAOF`,
-`KEYS`, SCAN-style commands, and Pub/Sub subscriptions cannot be queued. As with
+Node-directed commands (including `rawCommand` with a `[host, port]` array),
+`WAIT`, `WAITAOF`, `KEYS`, SCAN-style commands, and Pub/Sub subscriptions
+cannot be queued. `rawCommand` with a key is queued like a typed command on
+that key: the slot comes from the key with `OPT_PREFIX` applied (the command's
+own arguments are sent as given), and the reply is decoded as in ATOMIC mode.
+As in ATOMIC mode and in standalone pipelines, the raw command itself is not
+checked: one that does not answer with exactly one reply (such as `SUBSCRIBE`,
+`MONITOR` or `CLIENT REPLY OFF`) or that changes connection state (such as
+`MULTI`, `WATCH`, `HELLO`, `RESET` or `QUIT`) is the caller's responsibility.
+As with
 standalone pipelines, an ACL rejection of `MULTI` may cause buffered commands to
 execute outside the transaction. Blocking commands may prevent `exec()` from
 completing and should not rely on later commands in the pipeline to unblock
