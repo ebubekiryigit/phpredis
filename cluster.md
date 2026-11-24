@@ -169,6 +169,30 @@ execute outside the transaction. Blocking commands may prevent `exec()` from
 completing and should not rely on later commands in the pipeline to unblock
 them.
 
+With `RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS` set (it is off by default,
+and read when `pipeline()` or `multi(Redis::PIPELINE)` opens a pipeline, so a
+change while one is open applies to the next), a command answered with `MOVED`
+or `ASK` does not abort the pipeline: the node did not run it. Once every reply
+has been read, such commands are sent to the node the reply names (after
+`ASKING` for `ASK`), at most five more times, and their replies take their
+places in the result; `getLastError()` still describes the reply to the last
+command. A followed command never runs after a later command of the same
+pipeline that uses one of its keys: when such a command has already run, the
+pipeline aborts as it does without the option. A command's keys are the
+arguments phpredis builds as keys, and a key a script uses without declaring it
+is not known. A command routed by slot without known keys is not followed, and
+the pipeline aborts if one runs after any redirected command. Commands on
+different keys may run in another order than queued, as commands on different
+nodes already may. A redirect still aborts the pipeline for a command in a
+pipelined MULTI block, for a part of a distributed `MGET`, `MSET`, `MSETNX`,
+`DEL` or `UNLINK` other than its last, and when one slot's redirected commands
+name two nodes. `TRYAGAIN` returns `false`, as in ATOMIC mode. A script or
+module command that returns an error starting with `MOVED`, `ASK` or `TRYAGAIN`
+after doing its work is taken at its word: a script that always answers with a
+redirect runs six times before the pipeline gives up (ATOMIC mode runs it again
+until its timeout). With the option off, a pipeline records nothing for
+following and behaves as described above.
+
 Existing slot-cache limitation: the client that populates a cache entry
 cannot invalidate it.
 

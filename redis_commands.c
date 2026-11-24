@@ -7521,6 +7521,9 @@ void redis_getoption_handler(INTERNAL_FUNCTION_PARAMETERS,
         case REDIS_OPT_FAILOVER:
             if (c == NULL) RETURN_FALSE;
             RETURN_LONG(c->failover);
+        case REDIS_OPT_PIPELINE_FOLLOW_REDIRECTS:
+            if (c == NULL) RETURN_FALSE;
+            RETURN_BOOL(c->pipeline_follow_redirects);
         case REDIS_OPT_MAX_RETRIES:
             RETURN_LONG(redis_sock->max_retries);
         case REDIS_OPT_BACKOFF_ALGORITHM:
@@ -7670,6 +7673,10 @@ void redis_setoption_handler(INTERNAL_FUNCTION_PARAMETERS,
                 RETURN_TRUE;
             }
             break;
+        case REDIS_OPT_PIPELINE_FOLLOW_REDIRECTS:
+            if (c == NULL) RETURN_FALSE;
+            c->pipeline_follow_redirects = zend_is_true(val);
+            RETURN_TRUE;
         case REDIS_OPT_MAX_RETRIES:
             val_long = zval_get_long(val);
             if(val_long >= 0) {

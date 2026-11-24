@@ -33,6 +33,9 @@ static zend_always_inline zend_bool cluster_is_ask(const char *p, size_t len) {
 /* Initial allocation size for key distribution container */
 #define CLUSTER_KEYDIST_ALLOC 8
 
+/* How many times one pipeline sends redirected commands on before giving up */
+#define CLUSTER_PIPELINE_MAX_REDIRECTS 5
+
 /* Helper that either returns false or adds false in multi mode */
 #define CLUSTER_RETURN_FALSE(c) \
     if(cluster_is_atomic(c)) { \
@@ -143,6 +146,38 @@ typedef struct redisClusterNode {
 /* Forward declarations */
 typedef struct clusterFoldItem clusterFoldItem;
 
+/* A buffer the running pipeline wrote to one socket */
+typedef struct clusterPipelineBuffer {
+    RedisSock *sock;
+    smart_string buf;
+} clusterPipelineBuffer;
+
+/* What following redirects needs to know about a queued command, allocated
+ * only in a pipeline opened with OPT_PIPELINE_FOLLOW_REDIRECTS */
+typedef struct clusterFollowItem {
+    /* Where the command sits in its socket's buffer, so it can be sent
+     * again after MOVED or ASK.  A length of 0 means it can't be. */
+    size_t cmd_off;
+    size_t cmd_len;
+
+    /* A redirected command: the index of its reply in the pipeline result,
+     * the node it goes to next, and the pass that last sent it */
+    zend_ulong reply_idx;
+    redisClusterNode *redir_node;
+    CLUSTER_REDIR_TYPE redir_type;
+    uint8_t pass;
+
+    /* Whether its reply was TRYAGAIN, which means it did not run */
+    zend_bool tryagain;
+
+    /* Its keys as far as they are known (see RedisCmd): their number
+     * (CLUSTER_KEYS_UNKNOWN when the command named a slot without them), the
+     * hashes of the first few, one bit per key */
+    uint32_t nkeys;
+    zend_ulong key_hashes[REDIS_CMD_KEY_HASHES];
+    uint64_t key_bits;
+} clusterFollowItem;
+
 typedef enum {
     CLUSTER_FOLD_RESPONSE,
     CLUSTER_FOLD_MULTI,
@@ -202,6 +237,24 @@ typedef struct redisCluster {
 
     /* Refresh routing before another pipeline after a topology/transport failure. */
     zend_bool pipeline_refresh_slots;
+
+    /* OPT_PIPELINE_FOLLOW_REDIRECTS: send commands a pipeline sees answered
+     * with MOVED or ASK on to the node named, instead of aborting; and its
+     * value when the running pipeline was opened */
+    zend_bool pipeline_follow_redirects;
+    zend_bool pipeline_following;
+
+    /* Buffers the running pipeline wrote, kept until its replies are read so
+     * that redirected commands can be sent again */
+    clusterPipelineBuffer *pipeline_sent;
+    uint32_t pipeline_sent_count;
+
+    /* Commands the last pass of the running pipeline saw redirected */
+    uint32_t pipeline_redirected;
+
+    /* The pipeline result, held here while a followed reply is decoded
+     * into a scratch array, so a bailout can still release it */
+    zval pipeline_outer;
 
     /* Flag for when we get a CLUSTERDOWN error */
     short clusterdown;
@@ -314,7 +367,13 @@ struct clusterFoldItem {
 
     clusterFoldType type;
     uint8_t flags;
+
+    /* Set in a pipeline that follows redirects */
+    clusterFollowItem *follow;
 };
+
+/* A command that routes by slot without saying which keys it uses */
+#define CLUSTER_KEYS_UNKNOWN UINT32_MAX
 
 /* Owned, prefixed WATCH keys for one hash slot. */
 typedef struct clusterDistList {
@@ -440,6 +499,9 @@ PHP_REDIS_API int cluster_send_slot(redisCluster *c, short slot, const char *cmd
     int cmd_len, REDIS_REPLY_TYPE rtype);
 PHP_REDIS_API int cluster_send_pipeline(redisCluster *c, RedisSock *sock,
     const char *cmd, size_t cmd_len);
+PHP_REDIS_API void cluster_pipeline_keep_sent(redisCluster *c, RedisSock *sock,
+    const smart_string *buf);
+PHP_REDIS_API void cluster_pipeline_free_sent(redisCluster *c);
 
 PHP_REDIS_API redisCluster *cluster_create(double timeout, double read_timeout,
     int failover, int persistent);

@@ -62,6 +62,7 @@ static void cluster_enqueue_item(redisCluster *c, short slot, RedisSock *sock,
     item->next = NULL;
     item->type = type;
     item->flags = c->flags->flags;
+    item->follow = c->pipeline_following ? ecalloc(1, sizeof(*item->follow)) : NULL;
 
     if (UNEXPECTED(c->multi_head == NULL)) {
         c->multi_head = item;
@@ -145,6 +146,9 @@ static void cluster_pipeline_free_buffers(redisCluster *c)
 
     while (item) {
         if (item->sock) smart_string_free(&item->sock->pipeline_cmd);
+        if (item->follow && item->follow->redir_node) {
+            smart_string_free(&item->follow->redir_node->sock->pipeline_cmd);
+        }
         item = item->next;
     }
 }
@@ -158,6 +162,12 @@ static void cluster_pipeline_disconnect(redisCluster *c)
          * that participate in more than one queued command. */
         if (item->sock && item->sock->stream) {
             redis_sock_disconnect(item->sock, 1, 1);
+        }
+        /* A node a redirected command went to may hold unread replies too */
+        if (item->follow && item->follow->redir_node &&
+            item->follow->redir_node->sock->stream)
+        {
+            redis_sock_disconnect(item->follow->redir_node->sock, 1, 1);
         }
         item = item->next;
     }
@@ -179,8 +189,14 @@ static int cluster_pipeline_send_buffers(redisCluster *c)
         buf = item->sock->pipeline_cmd;
         memset(&item->sock->pipeline_cmd, 0, sizeof(item->sock->pipeline_cmd));
 
+        /* Following redirects sends commands again from this buffer, so it
+         * is kept until the replies are read */
         ret = cluster_send_pipeline(c, item->sock, buf.c, buf.len);
-        smart_string_free(&buf);
+        if (c->pipeline_following) {
+            cluster_pipeline_keep_sent(c, item->sock, &buf);
+        } else {
+            smart_string_free(&buf);
+        }
         if (ret < 0) {
             return -1;
         }
@@ -205,6 +221,8 @@ static int cluster_pipeline_check_reentry(redisCluster *c)
 static void cluster_clear_pipeline_state(redisCluster *c)
 {
     cluster_pipeline_free_buffers(c);
+    cluster_pipeline_free_sent(c);
+    c->pipeline_redirected = 0;
     smart_string_free(&c->pipeline_multi_cmd);
     cluster_free_queue(c);
     c->pipeline_slot = -1;
@@ -218,6 +236,8 @@ static void cluster_clear_pipeline_state(redisCluster *c)
 static void cluster_reset_pipeline(redisCluster *c)
 {
     cluster_clear_pipeline_state(c);
+    c->pipeline_following = 0;
+    c->flags->note_keys = 0;
     c->flags->mode = ATOMIC;
 }
 
@@ -233,6 +253,10 @@ static void cluster_start_pipeline(redisCluster *c)
     c->flags->txBytes = 0;
     c->flags->rxBytes = 0;
     c->flags->mode = PIPELINE;
+
+    /* A change of OPT_PIPELINE_FOLLOW_REDIRECTS applies to the next pipeline */
+    c->pipeline_following = c->pipeline_follow_redirects;
+    c->flags->note_keys = c->pipeline_following;
 }
 
 static int cluster_enter_pipeline(redisCluster *c)
@@ -289,12 +313,35 @@ static int cluster_pipeline_check_slot(redisCluster *c, short slot) {
     return 0;
 }
 
+/* What following redirects needs from a queued command: where its bytes are,
+ * which only a command outside a MULTI block can be sent again from, and its
+ * keys.  A command that named a slot without its keys (a raw command routed
+ * by key included) has unknown keys, which keeps it from being followed and
+ * makes it count as using any key (see cluster_pipeline_redirects_ordered). */
+static void cluster_pipeline_note_command(clusterFollowItem *f, RedisCmd *cmd,
+                                          size_t off, zend_bool resendable,
+                                          zend_bool random_slot)
+{
+    if (resendable) {
+        f->cmd_off = off;
+        f->cmd_len = redis_cmd_len(cmd);
+    }
+
+    if (random_slot)
+        return;
+
+    f->nkeys = cmd->nkeys ? cmd->nkeys : CLUSTER_KEYS_UNKNOWN;
+    memcpy(f->key_hashes, cmd->key_hashes, sizeof(cmd->key_hashes));
+    f->key_bits = cmd->nkeys ? cmd->key_bits : UINT64_MAX;
+}
+
 static int cluster_pipeline_enqueue(redisCluster *c, short slot, RedisCmd *cmd,
                                     cluster_cb cb, zend_bool fold_errors,
                                     RedisCmdCtx ctx)
 {
     RedisSock *sock;
     zend_bool random_slot = redis_cmd_slot_is_random(cmd);
+    size_t off;
 
     if (cluster_pipeline_check_reentry(c) == FAILURE) {
         return -1;
@@ -337,10 +384,17 @@ static int cluster_pipeline_enqueue(redisCluster *c, short slot, RedisCmd *cmd,
         sock = cluster_slot_master_sock(c, slot);
     }
 
+    off = sock->pipeline_cmd.len;
     smart_string_appendl(&sock->pipeline_cmd, redis_cmd_str(cmd),
                          redis_cmd_len(cmd));
     cluster_enqueue_item(c, slot, sock, cb, fold_errors, ctx,
                          CLUSTER_FOLD_RESPONSE);
+
+    if (c->multi_curr->follow) {
+        cluster_pipeline_note_command(c->multi_curr->follow, cmd, off,
+                                      !redis_sock_is_multi(c->flags),
+                                      random_slot);
+    }
     return 0;
 }
 
@@ -755,6 +809,17 @@ static void cluster_multi_ctx_dtor(void *ptr)
     efree(mctx);
 }
 
+/* Add a key to a distributed command, and note it for a pipeline that may
+ * have to keep redirected commands in order per key */
+static void cluster_multi_add_key(const redisCluster *c, clusterMultiCmd *mc,
+                                  const char *key, int key_len)
+{
+    cluster_multi_add(mc, key, key_len);
+    if (c->flags->note_keys) {
+        redis_cmd_note_key(mc->cmd, key, key_len);
+    }
+}
+
 /* Generic handler for MGET/MSET/MSETNX */
 static int
 distcmd_resp_handler(INTERNAL_FUNCTION_PARAMETERS, redisCluster *c, short slot,
@@ -956,7 +1021,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw, int kw
     }
 
     // Process our key and add it to the command
-    cluster_multi_add(&mc, ZSTR_VAL(key), ZSTR_LEN(key));
+    cluster_multi_add_key(c, &mc, ZSTR_VAL(key), ZSTR_LEN(key));
     zend_string_release(key);
 
     // Move to the next key
@@ -992,7 +1057,7 @@ static int cluster_mkey_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw, int kw
         }
 
         // Add this key to the command
-        cluster_multi_add(&mc, ZSTR_VAL(key), ZSTR_LEN(key));
+        cluster_multi_add_key(c, &mc, ZSTR_VAL(key), ZSTR_LEN(key));
         zend_string_release(key);
 
         // Update the last slot we encountered, and the key we're on
@@ -1070,7 +1135,7 @@ static int cluster_mset_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw, int kw
     zend_hash_move_forward_ex(ht_arr, &ptr);
 
     // Add this to our multi cmd, set slot, free key if we prefixed
-    cluster_multi_add(&mc, kv.key, kv.key_len);
+    cluster_multi_add_key(c, &mc, kv.key, kv.key_len);
     cluster_multi_add(&mc, kv.val, kv.val_len);
     if (kv.key_free) efree(kv.key);
     if (kv.val_free) efree(kv.val);
@@ -1096,7 +1161,7 @@ static int cluster_mset_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw, int kw
         }
 
         // Add this key and value to our command
-        cluster_multi_add(&mc, kv.key, kv.key_len);
+        cluster_multi_add_key(c, &mc, kv.key, kv.key_len);
         cluster_multi_add(&mc, kv.val, kv.val_len);
 
         // Free our key and value if we need to

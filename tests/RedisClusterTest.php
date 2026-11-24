@@ -168,8 +168,10 @@ class Redis_Cluster_Test extends Redis_Test {
 
     private function assertPipelineRedirectAbortsAcrossNodes(
         $type,
-        $nested = false
+        $nested = false,
+        $redis = null
     ) {
+        $redis = $redis ?? $this->redis;
         [$key, $control] = $this->keysOnDistinctMasters(
             'pipe-' . strtolower($type) . ($nested ? '-multi' : '')
         );
@@ -186,7 +188,7 @@ class Redis_Cluster_Test extends Redis_Test {
 
         $this->redis->set($key, 'still-readable');
         $this->redis->del($control);
-        $pipe = $this->redis->pipeline();
+        $pipe = $redis->pipeline();
 
         if ($nested) {
             $pipe->multi()
@@ -206,17 +208,17 @@ class Redis_Cluster_Test extends Redis_Test {
 
         $this->assertTrue($exception instanceof RedisClusterException);
         $this->assertStringContains('redirected', $exception->getMessage());
-        $this->assertEquals(Redis::ATOMIC, $this->redis->getMode());
+        $this->assertEquals(Redis::ATOMIC, $redis->getMode());
 
         /* Both sockets had unread replies when the redirect was observed. */
-        $this->assertEquals('still-readable', $this->redis->get($key));
+        $this->assertEquals('still-readable', $redis->get($key));
         $this->assertEquals(
             'queued-on-other-node',
-            $this->redis->get($control)
+            $redis->get($control)
         );
         $this->assertEquals(
             ['still-readable', 'queued-on-other-node'],
-            $this->redis->pipeline()->get($key)->get($control)->exec()
+            $redis->pipeline()->get($key)->get($control)->exec()
         );
     }
 
@@ -3174,6 +3176,86 @@ class Redis_Cluster_Test extends Redis_Test {
         }
     }
 
+    public function testPipelineFollowedMovedRefreshesRouting() {
+        $class = $this->getRedisClusterClass();
+        $cacheSlots = ini_get('redis.clusters.cache_slots');
+        $nodes = [];
+        foreach ($this->redis->_masters() as $master) $nodes[] = $this->connectToNode($master);
+        $ids = array_map(function ($node) { return $node->rawCommand('CLUSTER', 'MYID'); }, $nodes);
+
+        try {
+            foreach (['plain', 'nested', 'cached'] as $variant) {
+                ini_set('redis.clusters.cache_slots', $variant === 'cached' ? 1 : 0);
+                [$key, $slot] = $this->emptySlotKey('pipe-follow-moved-' . $variant);
+                $owner = array_search($this->redis->cluster($key, 'MYID'), $ids, true);
+                $target = ($owner + 1) % count($nodes);
+                $populator = $fresh = null;
+                if ($variant === 'cached') {
+                    $populator = new $class(null, self::$seeds, 1, 1, false, $this->getAuth());
+                }
+                $redis = $this->followingRedis();
+
+                try {
+                    $pipe = $redis->pipeline();
+                    if ($variant === 'nested') $pipe->multi();
+                    $pipe->get($key);
+                    if ($variant === 'nested') $pipe->exec();
+                    foreach ($nodes as $node) {
+                        $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'NODE', $ids[$target]) !== false);
+                    }
+                    $this->assertTrue($nodes[$target]->set($key, 'new-owner'));
+                    $this->waitForSlotOwner($slot, $ids[$target]);
+
+                    /* The MOVED is followed without mapping the cluster
+                     * again; in a transaction the queued command's MOVED
+                     * aborts the pipeline as without the option */
+                    $before = $this->clusterSlotsCalls();
+                    if ($variant === 'nested') {
+                        $exception = null;
+                        try {
+                            $pipe->exec();
+                        } catch (RedisClusterException $e) {
+                            $exception = $e;
+                        }
+                        $this->assertTrue($exception instanceof RedisClusterException);
+                        $this->assertStringContains('redirected', $exception->getMessage());
+                    } else {
+                        $this->assertEquals(['new-owner'], $pipe->exec());
+                    }
+                    $this->assertEquals($before, $this->clusterSlotsCalls());
+
+                    /* The slot cache no longer holds the old owner */
+                    if ($variant === 'cached') {
+                        $fresh = new $class(null, self::$seeds, 1, 1, false, $this->getAuth());
+                        $this->assertEquals($before + 1, $this->clusterSlotsCalls());
+                        $this->assertEquals('new-owner', $fresh->get($key));
+                    }
+
+                    /* The next pipeline maps the cluster once and goes to the
+                     * new owner: with the option off it aborts otherwise */
+                    $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, false));
+                    $beforeRefresh = $this->clusterSlotsCalls();
+                    $this->assertEquals(['new-owner'], $redis->pipeline()->get($key)->exec());
+                    $this->assertEquals($beforeRefresh + 1, $this->clusterSlotsCalls());
+                    $this->assertEquals(['new-owner'], $redis->pipeline()->get($key)->exec());
+                    $this->assertEquals($beforeRefresh + 1, $this->clusterSlotsCalls());
+                } finally {
+                    $nodes[$target]->del($key);
+                    foreach ($nodes as $node) {
+                        $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'NODE', $ids[$owner]) !== false);
+                    }
+                    $this->waitForSlotOwner($slot, $ids[$owner]);
+                    foreach ([$redis, $populator, $fresh] as $client) {
+                        if ($client) $client->close();
+                    }
+                }
+            }
+        } finally {
+            foreach ($nodes as $node) $node->close();
+            ini_set('redis.clusters.cache_slots', $cacheSlots);
+        }
+    }
+
     public function testPipelineRealAskDoesNotRefreshRouting() {
         $class = $this->getRedisClusterClass();
         [$key, $slot] = $this->emptySlotKey('pipe-real-ask');
@@ -3233,9 +3315,507 @@ class Redis_Cluster_Test extends Redis_Test {
         $this->assertPipelineRedirectAbortsAcrossNodes('ASK');
     }
 
+    private function followingRedis() {
+        $class = $this->getRedisClusterClass();
+        $redis = new $class(null, self::$seeds, 1, 1, false, $this->getAuth());
+        $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, true));
+        return $redis;
+    }
+
+    /* The address of the master serving $key's slot */
+    private function ownerEndpoint($key) {
+        $owner = $this->redis->cluster($key, 'MYID');
+        foreach ($this->redis->_masters() as $master) {
+            if ($this->redis->cluster($master, 'MYID') === $owner) {
+                return sprintf('%s:%d', $master[0], $master[1]);
+            }
+        }
+        throw new RuntimeException("No master serves $key");
+    }
+
+    /* A script that counts its runs in KEYS[1] and answers its first run with
+     * a redirect to $endpoint, later runs with $later */
+    private function redirectOnceScript($type, $key, $endpoint, $later) {
+        $slot = $this->redis->cluster($key, 'KEYSLOT', $key);
+        return sprintf("if redis.call('INCR', KEYS[1]) == 1 then " .
+                       "return redis.error_reply('%s %d %s') end return %s",
+                       $type, $slot, $endpoint, $later);
+    }
+
+    public function testPipelineFollowRedirectsOption() {
+        $class = $this->getRedisClusterClass();
+        $this->assertFalse($this->redis->getOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS));
+        $redis = $this->followingRedis();
+        $this->assertTrue($redis->getOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS));
+        $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, false));
+        $this->assertFalse($redis->getOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS));
+        $redis->close();
+
+        /* Off, a redirect aborts the pipeline and nothing is sent again */
+        [$key] = $this->keysOnDistinctMasters('pipe-follow-off');
+        $runs = "$key:runs";
+        $this->redis->del($runs);
+        $script = $this->redirectOnceScript('ASK', $runs, $this->ownerEndpoint($runs), "'second run'");
+        $exception = null;
+        try {
+            $this->redis->pipeline()->eval($script, [$runs], 1)->exec();
+        } catch (RedisClusterException $e) {
+            $exception = $e;
+        }
+        $this->assertTrue($exception instanceof RedisClusterException);
+        $this->assertStringContains('redirected', $exception->getMessage());
+        $this->assertEquals('1', $this->redis->get($runs));
+
+        /* The option counts when the pipeline is opened */
+        $redis = new $class(null, self::$seeds, 1, 1, false, $this->getAuth());
+        foreach ([[false, true], [true, false]] as [$opened, $changed]) {
+            $this->redis->del($runs);
+            $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, $opened));
+            $pipe = $redis->pipeline()->eval($script, [$runs], 1);
+            $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, $changed));
+            $exception = $result = null;
+            try {
+                $result = $pipe->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            if ($opened) {
+                $this->assertEquals(['second run'], $result);
+            } else {
+                $this->assertTrue($exception instanceof RedisClusterException);
+            }
+        }
+        $redis->close();
+        $this->redis->del($runs);
+    }
+
+    public function testPipelineFollowsRedirectsDuringMigration() {
+        [$key, $slot] = $this->emptySlotKey('pipe-follow');
+        $name = function ($suffix) use ($key) { return str_replace('}key', "}$suffix", $key); };
+        [$moved, $counter, $string, $deleted, $set, $setnx] =
+            array_map($name, ['moved', 'counter', 'string', 'deleted', 'set', 'setnx']);
+        $nodes = [];
+        foreach ($this->redis->_masters() as $master) $nodes[] = $this->connectToNode($master);
+        $ids = array_map(function ($node) { return $node->rawCommand('CLUSTER', 'MYID'); }, $nodes);
+        $owner = array_search($this->redis->cluster($key, 'MYID'), $ids, true);
+        $target = ($owner + 1) % count($nodes);
+        $others = [];
+        for ($i = 0; $i < 256 && count($others) < 4; $i++) {
+            $other = "{pipe-follow-other-$i}key";
+            if ($this->redis->cluster($other, 'MYID') !== $ids[$owner]) $others[] = $other;
+        }
+        [$control, $control2, $control3, $control4] = $others;
+        $redis = $this->followingRedis();
+
+        try {
+            $this->redis->del($others);
+            $this->assertTrue($this->redis->set($key, 'on-source'));
+            $this->assertTrue($this->redis->mset([$control => 'control', $control2 => 'control2']));
+            $this->assertTrue($nodes[$target]->rawCommand('CLUSTER', 'SETSLOT', $slot, 'IMPORTING', $ids[$owner]) !== false);
+            $this->assertTrue($nodes[$owner]->rawCommand('CLUSTER', 'SETSLOT', $slot, 'MIGRATING', $ids[$target]) !== false);
+            foreach ([$moved => 'on-target', $counter => '0', $string => 'a string', $deleted => 'x'] as $k => $v) {
+                $nodes[$target]->rawCommand('ASKING');
+                $this->assertTrue($nodes[$target]->set($k, $v));
+            }
+
+            /* The source runs what it holds and answers ASK for the rest; a
+             * followed reply, an error one included, takes its own place */
+            $ret = $redis->pipeline()
+                ->get($key)->get($moved)->incr($counter)->get($control)
+                ->set($moved, 'written')->get($moved)
+                ->mget([$control, $moved])
+                ->del([$control2, $deleted])
+                ->mset([$control3 => 'c3', $set => 'set'])
+                ->msetnx([$control4 => 'c4', $setnx => 'setnx'])
+                ->hGet($string, 'field')
+                ->get($control)
+                ->exec();
+            $this->assertEquals(['on-source', 'on-target', 1, 'control', true, 'written',
+                                 ['control', 'written'], 2, true, [1, 1], false, 'control'], $ret);
+            /* getLastError() describes the last command's reply, which ran
+             * before the follow pass read the WRONGTYPE */
+            $this->assertNull($redis->getLastError());
+            foreach ([$counter => '1', $set => 'set', $setnx => 'setnx', $deleted => false] as $k => $v) {
+                $nodes[$target]->rawCommand('ASKING');
+                $this->assertEquals($v, $nodes[$target]->get($k));
+            }
+
+            /* The last command followed, its reply an error */
+            $this->assertEquals(['control', false],
+                                $redis->pipeline()->get($control)->hGet($string, 'field')->exec());
+            $this->assertStringContains('WRONGTYPE', $redis->getLastError());
+
+            /* A distributed command is followed only when its redirected part
+             * is its last: the parts after it have already been read */
+            $exception = null;
+            try {
+                $redis->pipeline()->mget([$moved, $control])->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertStringContains('redirected', $exception->getMessage());
+            $this->assertEquals(['written', 'control'], $redis->mget([$moved, $control]));
+        } finally {
+            foreach ([$moved, $counter, $string, $deleted, $set, $setnx] as $k) {
+                $nodes[$target]->rawCommand('ASKING');
+                $nodes[$target]->del($k);
+            }
+            $nodes[$owner]->del($key);
+            foreach ($nodes as $node) {
+                $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'STABLE') !== false);
+                $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'NODE', $ids[$owner]) !== false);
+                $node->close();
+            }
+            $this->waitForSlotOwner($slot, $ids[$owner]);
+            $this->redis->del($others);
+            $redis->close();
+        }
+    }
+
+    public function testPipelineFollowsTwoHopRedirect() {
+        if (count($this->redis->_masters()) < 3)
+            $this->markTestSkipped('Requires three cluster masters');
+
+        [$key, $slot] = $this->emptySlotKey('pipe-follow-two-hops');
+        $nodes = [];
+        foreach ($this->redis->_masters() as $master) $nodes[] = $this->connectToNode($master);
+        $ids = array_map(function ($node) { return $node->rawCommand('CLUSTER', 'MYID'); }, $nodes);
+        $a = array_search($this->redis->cluster($key, 'MYID'), $ids, true);
+        $b = ($a + 1) % count($nodes);
+        $c = ($a + 2) % count($nodes);
+        /* Its map still says A */
+        $redis = $this->followingRedis();
+
+        try {
+            /* The slot moves to B, and B starts migrating it to C, where the key is */
+            foreach ($nodes as $node) {
+                $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'NODE', $ids[$b]) !== false);
+            }
+            $this->waitForSlotOwner($slot, $ids[$b]);
+            $this->assertTrue($nodes[$c]->rawCommand('CLUSTER', 'SETSLOT', $slot, 'IMPORTING', $ids[$b]) !== false);
+            $this->assertTrue($nodes[$b]->rawCommand('CLUSTER', 'SETSLOT', $slot, 'MIGRATING', $ids[$c]) !== false);
+            $nodes[$c]->rawCommand('ASKING');
+            $this->assertTrue($nodes[$c]->set($key, 'on-c'));
+
+            /* A answers MOVED to B, B answers ASK to C */
+            $this->assertEquals(['on-c', true], $redis->pipeline()->get($key)->set("$key:other", 'x')->exec());
+            $redis->del("$key:other");
+        } finally {
+            $nodes[$c]->rawCommand('ASKING');
+            $nodes[$c]->del($key);
+            $nodes[$c]->rawCommand('ASKING');
+            $nodes[$c]->del("$key:other");
+            foreach ($nodes as $node) {
+                $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'STABLE') !== false);
+                $this->assertTrue($node->rawCommand('CLUSTER', 'SETSLOT', $slot, 'NODE', $ids[$a]) !== false);
+                $node->close();
+            }
+            $this->waitForSlotOwner($slot, $ids[$a]);
+            $redis->close();
+        }
+    }
+
+    public function testPipelineFollowedRedirectsKeepKeyOrderOrAbort() {
+        [$key] = $this->keysOnDistinctMasters('pipe-follow-order');
+        $runs = "$key:runs";
+        $other = "$key:other";
+        $endpoint = $this->ownerEndpoint($key);
+        $redis = $this->followingRedis();
+        $this->redis->set($other, 'other');
+
+        /* A redirect and then a command that ran on the same key: following
+         * would put the redirected command after it */
+        foreach (['MOVED', 'ASK'] as $type) {
+            $this->redis->del($runs);
+            $exception = null;
+            try {
+                $redis->pipeline()
+                    ->eval($this->redirectOnceScript($type, $runs, $endpoint, "'second run'"), [$runs], 1)
+                    ->get($runs)->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertStringContains('redirected', $exception->getMessage());
+            $this->assertEquals('1', $this->redis->get($runs));
+        }
+
+        /* Another key of the same slot does not hold the redirected one back */
+        $this->redis->del($runs);
+        $this->assertEquals(['second run', 'other'], $redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"), [$runs], 1)
+            ->get($other)->exec());
+        $this->assertEquals('2', $this->redis->get($runs));
+
+        /* Nor does a command on the same key that did not run (TRYAGAIN) */
+        $this->redis->del($runs);
+        $this->assertEquals(['second run', false], $redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"), [$runs], 1)
+            ->eval("return redis.error_reply('TRYAGAIN fixture')", [$runs], 1)
+            ->exec());
+        $this->assertEquals('2', $this->redis->get($runs));
+
+        /* One slot's redirected commands may not name two nodes */
+        $masters = $this->redis->_masters();
+        $elsewhere = null;
+        foreach ($masters as $master) {
+            $address = sprintf('%s:%d', $master[0], $master[1]);
+            if ($address !== $endpoint) $elsewhere = $address;
+        }
+        $this->redis->del([$runs, "$runs:2"]);
+        $exception = null;
+        try {
+            $redis->pipeline()
+                ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"), [$runs], 1)
+                ->eval($this->redirectOnceScript('ASK', "$runs:2", $elsewhere, "'second run'"), ["$runs:2"], 1)
+                ->exec();
+        } catch (RedisClusterException $e) {
+            $exception = $e;
+        }
+        $this->assertTrue($exception instanceof RedisClusterException);
+        $this->assertStringContains('redirected', $exception->getMessage());
+        $this->assertEquals(['1', '1'], $this->redis->mget([$runs, "$runs:2"]));
+
+        /* A node that keeps redirecting: the first pass and five more */
+        $this->redis->del($runs);
+        $loop = sprintf("redis.call('INCR', KEYS[1]) return redis.error_reply('ASK %d %s')",
+                        $this->redis->cluster($runs, 'KEYSLOT', $runs), $endpoint);
+        $exception = null;
+        try {
+            $redis->pipeline()->eval($loop, [$runs], 1)->exec();
+        } catch (RedisClusterException $e) {
+            $exception = $e;
+        }
+        $this->assertTrue($exception instanceof RedisClusterException);
+        $this->assertStringContains('too many times', $exception->getMessage());
+        $this->assertEquals('6', $this->redis->get($runs));
+
+        $this->redis->del([$runs, "$runs:2", $other]);
+        $redis->close();
+    }
+
+    public function testPipelineFollowOrderInLaterPassesAndWideOrUnknownKeys() {
+        [$key] = $this->keysOnDistinctMasters('pipe-follow-wide');
+        $endpoint = $this->ownerEndpoint($key);
+        $slot = $this->redis->cluster($key, 'KEYSLOT', $key);
+        $runs = "$key:runs";
+        $wide = array_map(function ($i) use ($key) { return "$key:w$i"; }, range(1, 5));
+        $redis = $this->followingRedis();
+        $aborts = function ($pipe) {
+            $exception = null;
+            try {
+                $pipe->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertStringContains('redirected', $exception->getMessage());
+        };
+        $askWhile = function ($runs) use ($slot, $endpoint) {
+            return sprintf("if redis.call('INCR', KEYS[2]) <= %d then " .
+                           "return redis.error_reply('ASK %d %s') end return 'done'",
+                           $runs, $slot, $endpoint);
+        };
+
+        /* A later pass: both commands on $key are redirected first; in the
+         * next pass the first is redirected again while the second runs */
+        $this->redis->del(["$runs:a", "$runs:b"]);
+        $aborts($redis->pipeline()
+            ->eval($askWhile(2), [$key, "$runs:a"], 2)
+            ->eval($askWhile(1), [$key, "$runs:b"], 2));
+        $this->assertEquals(['2', '2'], $this->redis->mget(["$runs:a", "$runs:b"]));
+
+        /* More than four keys are known by their bits: a five-key command
+         * that runs after a redirect on one of them aborts ... */
+        $this->redis->mset(array_fill_keys($wide, 'w'));
+        $this->redis->del($runs);
+        $aborts($redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"), [$runs, $wide[0]], 2)
+            ->mget($wide));
+        $this->assertEquals('1', $this->redis->get($runs));
+
+        /* ... and so does a command on one key of a redirected five-key one */
+        $this->redis->del($runs);
+        $aborts($redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"),
+                   array_merge([$runs], $wide), 6)
+            ->get($wide[2]));
+        $this->assertEquals('1', $this->redis->get($runs));
+
+        /* A command routed by slot without its keys (HIMPORT DISCARDALL takes
+         * none) may use any key, so it must not run after a redirect, even
+         * one in another slot */
+        for ($i = 0; $i < 256; $i++) {
+            $hash = "pipe-follow-unknown-$i";
+            if ($this->redis->cluster($hash, 'KEYSLOT', $hash) !== $slot) break;
+        }
+        $this->redis->del($runs);
+        $aborts($redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "'second run'"), [$runs], 1)
+            ->himport('DISCARDALL', $hash));
+        $this->assertEquals('1', $this->redis->get($runs));
+
+        $this->redis->del(array_merge($wide, [$runs, "$runs:a", "$runs:b"]));
+        $redis->close();
+    }
+
+    public function testPipelineFollowPassReplies() {
+        [$key, $control] = $this->keysOnDistinctMasters('pipe-follow-replies');
+        $runs = "$key:runs";
+        $endpoint = $this->ownerEndpoint($key);
+        $redis = $this->followingRedis();
+        $this->redis->set($control, 'control');
+
+        /* An ordinary error in a follow pass is false in its own place */
+        $this->redis->del($runs);
+        $this->assertEquals([false, 'control'], $redis->pipeline()
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "redis.error_reply('ERR second run')"), [$runs], 1)
+            ->get($control)->exec());
+        $this->assertNull($redis->getLastError());
+
+        $this->redis->del($runs);
+        $this->assertEquals(['control', false], $redis->pipeline()
+            ->get($control)
+            ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "redis.error_reply('ERR second run')"), [$runs], 1)
+            ->exec());
+        $this->assertStringContains('second run', $redis->getLastError());
+
+        /* CLUSTERDOWN in a follow pass aborts like CLUSTERDOWN in the first */
+        $this->redis->del($runs);
+        $exception = null;
+        try {
+            $redis->pipeline()->get($control)
+                ->eval($this->redirectOnceScript('ASK', $runs, $endpoint, "redis.error_reply('CLUSTERDOWN fixture')"), [$runs], 1)
+                ->exec();
+        } catch (RedisClusterException $e) {
+            $exception = $e;
+        }
+        $this->assertTrue($exception instanceof RedisClusterException);
+        $this->assertStringContains('CLUSTERDOWN', $exception->getMessage());
+        $this->assertEquals(Redis::ATOMIC, $redis->getMode());
+        $this->assertEquals(['control'], $redis->pipeline()->get($control)->exec());
+
+        $this->redis->del([$runs, $control]);
+        $redis->close();
+    }
+
+    public function testPipelineFollowAbortLeavesNoReplyBehind() {
+        $masters = $this->redis->_masters();
+        if (count($masters) < 3) $this->markTestSkipped('Requires three cluster masters');
+        $nodes = [];
+        foreach ($masters as $master) $nodes[] = $this->connectToNode($master);
+        $ids = array_map(function ($node) { return $node->rawCommand('CLUSTER', 'MYID'); }, $nodes);
+        $endpoints = array_map(function ($master) { return sprintf('%s:%d', $master[0], $master[1]); }, $masters);
+        $owner = function ($key) use ($ids) { return array_search($this->redis->cluster($key, 'MYID'), $ids, true); };
+
+        /* x and y in two empty slots of master A; B imports x's slot, C y's */
+        [$x, $xSlot] = $this->emptySlotKey('pipe-follow-unread-x');
+        $a = $owner($x);
+        $b = ($a + 1) % 3;
+        $c = ($a + 2) % 3;
+        for ($i = 0, $y = null; $i < 64 && $y === null; $i++) {
+            [$key, $slot] = $this->emptySlotKey("pipe-follow-unread-y$i");
+            if ($slot !== $xSlot && $owner($key) === $a) [$y, $ySlot] = [$key, $slot];
+        }
+        for ($i = 0, $onB = null; $i < 64 && $onB === null; $i++) {
+            if ($owner("{pipe-follow-unread-b$i}key") === $b) $onB = "{pipe-follow-unread-b$i}key";
+        }
+        $this->assertTrue($y !== null && $onB !== null);
+
+        /* Where the key exists (A) a script answers ASK; on the importing
+         * node x's script answers with a value and y's with CLUSTERDOWN */
+        $script = "if redis.call('EXISTS', KEYS[1]) == 1 then return redis.error_reply('ASK %d %s') end return %s";
+        $xScript = sprintf($script, $xSlot, $endpoints[$b], "'reply left on B'");
+        $yScript = sprintf($script, $ySlot, $endpoints[$c], "redis.error_reply('CLUSTERDOWN fixture')");
+        $this->redis->mset([$x => 'a', $y => 'a', $onB => 'own value']);
+        $this->assertTrue($nodes[$b]->rawCommand('CLUSTER', 'SETSLOT', $xSlot, 'IMPORTING', $ids[$a]) !== false);
+        $this->assertTrue($nodes[$c]->rawCommand('CLUSTER', 'SETSLOT', $ySlot, 'IMPORTING', $ids[$a]) !== false);
+        $redis = $this->followingRedis();
+
+        try {
+            /* B gets both x commands, C gets y; C's CLUSTERDOWN aborts the
+             * follow pass before the second reply of B is read */
+            $exception = null;
+            try {
+                $redis->pipeline()->eval($xScript, [$x], 1)->eval($yScript, [$y], 1)
+                    ->eval($xScript, [$x], 1)->exec();
+            } catch (RedisClusterException $e) {
+                $exception = $e;
+            }
+            $this->assertTrue($exception instanceof RedisClusterException);
+            $this->assertStringContains('CLUSTERDOWN', $exception->getMessage());
+
+            /* B's socket was closed with the reply on it, so a command sent
+             * there reads its own reply */
+            $this->assertEquals('own value', $redis->get($onB));
+            $this->assertEquals(['own value'], $redis->pipeline()->get($onB)->exec());
+        } finally {
+            $nodes[$b]->rawCommand('CLUSTER', 'SETSLOT', $xSlot, 'STABLE');
+            $nodes[$c]->rawCommand('CLUSTER', 'SETSLOT', $ySlot, 'STABLE');
+            $this->redis->del([$x, $y, $onB]);
+            $redis->close();
+            foreach ($nodes as $node) $node->close();
+        }
+    }
+
+    public function testPipelineFollowPassFixtureFailures() {
+        $class = $this->getRedisClusterClass();
+        $cases = [
+            'follow-asking-error' => 'Unexpected reply to ASKING',
+            'follow-malformed' => 'Error reading pipeline response',
+            /* SET one is answered with ASK, then SET two runs on the same
+             * node, as after a migration rolled back: SET one must not be
+             * sent again */
+            'follow-rollback' => 'redirected',
+            /* The node an ASK names refuses the connection */
+            'follow-closed' => 'Unable to send pipeline to node',
+            /* The node an ASK names reads ASKING and closes */
+            'follow-closing' => 'Error reading pipeline response',
+        ];
+
+        foreach ($cases as $scenario => $message) {
+            [$process, $pipes, $port] = $this->startMalformedReplyServer($scenario);
+            $redis = null;
+
+            try {
+                $redis = new $class(null, ["127.0.0.1:$port"], 1, 1, false);
+                $this->assertTrue($redis->setOption(RedisCluster::OPT_PIPELINE_FOLLOW_REDIRECTS, true));
+                $pipe = $redis->pipeline();
+                if ($scenario === 'follow-rollback') {
+                    $pipe->set('k', 'one')->set('k', 'two');
+                } else {
+                    $pipe->get('redirected')->get('other');
+                }
+                $exception = null;
+                try {
+                    $pipe->exec();
+                } catch (RedisClusterException $e) {
+                    $exception = $e;
+                }
+                $this->assertTrue($exception instanceof RedisClusterException);
+                $this->assertStringContains($message, $exception->getMessage());
+                $this->assertEquals(Redis::ATOMIC, $redis->getMode());
+                $this->assertEquals($scenario === 'follow-rollback' ? 'not-resent' : 'actual',
+                                    $redis->get($scenario === 'follow-rollback' ? 'k' : 'other'));
+            } finally {
+                if ($redis) @$redis->close();
+                $this->stopMalformedReplyServer($process, $pipes);
+            }
+        }
+    }
+
     public function testPipelinedMultiRedirectsAbortAcrossNodes() {
         $this->assertPipelineRedirectAbortsAcrossNodes('MOVED', true);
         $this->assertPipelineRedirectAbortsAcrossNodes('ASK', true);
+    }
+
+    public function testPipelinedMultiRedirectsAbortWhenFollowing() {
+        /* A transaction is never followed: the option changes nothing here */
+        $redis = $this->followingRedis();
+        $this->assertPipelineRedirectAbortsAcrossNodes('MOVED', true, $redis);
+        $this->assertPipelineRedirectAbortsAcrossNodes('ASK', true, $redis);
+        $redis->close();
     }
 
     public function testPipelineTryAgainReturnsFalseAndContinues() {

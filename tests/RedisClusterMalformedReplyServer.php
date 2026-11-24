@@ -63,7 +63,9 @@ function writeToClient($client, $response) {
 $scenario = $argv[1] ?? '';
 if (!in_array($scenario, [
     'pipeline', 'multi', 'multi-framing', 'partial-slots', 'cache-auth', 'failover-partial-slots',
-    'eof-header', 'eof-body', 'send-failure', 'cache-refresh', 'failed-reconnect'
+    'eof-header', 'eof-body', 'send-failure', 'cache-refresh', 'failed-reconnect',
+    'follow-asking-error', 'follow-malformed', 'follow-rollback', 'follow-closed',
+    'follow-closing'
 ], true)) {
     exit(1);
 }
@@ -92,6 +94,21 @@ if ($scenario === 'send-failure') {
     $sendSlots = "*2\r\n*3\r\n:0\r\n:8191\r\n*2\r\n$9\r\n127.0.0.1\r\n:$port\r\n" .
                  "*3\r\n:8192\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:$closedPort\r\n";
 }
+$followServer = null;
+$followPort = $port;
+if ($scenario === 'follow-closed' || $scenario === 'follow-closing') {
+    /* The node a followed command is sent to: an endpoint reserved and
+     * closed again, or one that reads ASKING and closes with the command
+     * still unread */
+    $followServer = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+    if ($followServer === false) exit(1);
+    $address = stream_socket_get_name($followServer, false);
+    $followPort = (int)substr(strrchr($address, ':'), 1);
+    if ($scenario === 'follow-closed') {
+        fclose($followServer);
+        $followServer = null;
+    }
+}
 $replicaServer = null;
 if ($scenario === 'failover-partial-slots') {
     /* Reserve a distinct replica endpoint so MOVED enters the failover remap. */
@@ -112,6 +129,7 @@ $refreshPending = false;
 $reconnectPending = $reconnectRejected = false;
 $connectionId = 0;
 $slotsRequests = $writes = $getReplies = 0;
+$followRedirected = $followResent = false;
 $deadline = microtime(true) + 15;
 
 while (microtime(true) < $deadline) {
@@ -121,7 +139,7 @@ while (microtime(true) < $deadline) {
     }
 
     $connectionId++;
-    $inMulti = false;
+    $inMulti = $asking = false;
     $authenticated = false;
     stream_set_timeout($client, 5);
 
@@ -152,6 +170,42 @@ while (microtime(true) < $deadline) {
             writeToClient($client, $partial
                 ? "*1\r\n*3\r\n:0\r\n:0\r\n*2\r\n$9\r\n127.0.0.1\r\n:$port\r\n"
                 : ($scenario === 'send-failure' && !$refreshPending ? $sendSlots : $slots));
+        } else if (strncmp($scenario, 'follow-', 7) === 0 && $verb === 'ASKING') {
+            /* A followed command comes after ASKING */
+            $asking = $scenario !== 'follow-asking-error';
+            writeToClient($client, $asking ? "+OK\r\n" : "-ERR fixture refuses ASKING\r\n");
+        } else if ($scenario === 'follow-rollback' && $verb === 'SET') {
+            if ($asking) {
+                /* The importing node answers MOVED once the migration is rolled back */
+                $asking = false;
+                $followResent = true;
+                writeToClient($client, "-MOVED 0 127.0.0.1:$port\r\n");
+            } else {
+                writeToClient($client, ($command[2] ?? '') === 'one'
+                    ? "-ASK 0 127.0.0.1:$port\r\n" : "+OK\r\n");
+            }
+        } else if ($scenario === 'follow-rollback' && $verb === 'GET') {
+            writeToClient($client, $followResent ? "$6\r\nresent\r\n" : "$10\r\nnot-resent\r\n");
+        } else if (strncmp($scenario, 'follow-', 7) === 0 && $verb === 'GET') {
+            if (($command[1] ?? '') === 'redirected' && !$followRedirected) {
+                $followRedirected = true;
+                writeToClient($client, "-ASK 0 127.0.0.1:$followPort\r\n");
+            } else if ($asking) {
+                $asking = false;
+                writeToClient($client, $malformed);
+            } else {
+                writeToClient($client, "$6\r\nactual\r\n");
+                if ($followServer && $followRedirected) {
+                    /* The follow pass connects after this reply */
+                    $follower = @stream_socket_accept($followServer, 5);
+                    if ($follower) {
+                        readCommandFromClient($follower);
+                        fclose($follower);
+                    }
+                    fclose($followServer);
+                    $followServer = null;
+                }
+            }
         } else if ($scenario === 'cache-refresh' && $verb === 'EVAL') {
             if (strpos($command[1], 'ASK') !== false) {
                 writeToClient($client, "-ASK 0 127.0.0.1:$port\r\n");

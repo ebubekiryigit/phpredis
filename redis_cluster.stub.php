@@ -55,6 +55,16 @@ class RedisCluster {
      */
     public const FAILOVER_DISTRIBUTE_SLAVES = UNKNOWN;
 
+    /**
+     * Whether a pipeline sends commands answered with MOVED or ASK on to the
+     * node named in the reply, instead of aborting.  Off by default.
+     *
+     * @var int
+     * @cvalue REDIS_OPT_PIPELINE_FOLLOW_REDIRECTS
+     *
+     */
+    public const OPT_PIPELINE_FOLLOW_REDIRECTS = UNKNOWN;
+
     public function __construct(string|null $name, ?array $seeds = null, int|float $timeout = 0, int|float $read_timeout = 0, bool $persistent = false, #[\SensitiveParameter] mixed $auth = null, ?array $context = null);
 
     /**
