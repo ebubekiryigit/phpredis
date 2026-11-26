@@ -4576,6 +4576,58 @@ class Redis_Test extends TestSuite {
         $redis->close();
     }
 
+    /* HMGET, HGETEX and HGETDEL replies share their table with the command
+       context. A pipeline that fails after such a reply was decoded releases
+       the reply first, which leaves the table in the GC root buffer, so the
+       context must not free the table behind the collector's back. */
+    public function testPipelineHashReadFailedMultiBlock() {
+        if ( ! $this->havePipeline())
+            $this->markTestSkipped();
+
+        $commands = ['hmget'];
+        if ($this->minVersionCheck('8.0'))
+            array_push($commands, 'hgetex', 'hgetdel');
+
+        foreach ($commands as $command) {
+            $redis = new Redis([
+                'host' => $this->getHost(),
+                'port' => $this->getPort(),
+            ]);
+
+            if ($this->getAuth())
+                $this->assertTrue($redis->auth($this->getAuth()));
+
+            $redis->del('pipeline-hash-read');
+            $redis->hset('pipeline-hash-read', 'field', 'value');
+
+            /* The server refuses to queue the unknown command, so reading the
+               MULTI block fails after the hash read's reply was decoded. */
+            $pipe = $redis->pipeline();
+            $pipe->$command('pipeline-hash-read', ['field']);
+            $pipe->multi();
+            $pipe->rawCommand('PHPREDIS-UNKNOWN-COMMAND');
+            $pipe->exec();
+            $this->assertFalse($pipe->exec());
+
+            /* The reply to EXEC is still unread, so don't reuse the socket. */
+            $redis->close();
+
+            /* Walks the root buffer, where a freed table would still be. */
+            gc_collect_cycles();
+        }
+
+        $redis = new Redis([
+            'host' => $this->getHost(),
+            'port' => $this->getPort(),
+        ]);
+
+        if ($this->getAuth())
+            $this->assertTrue($redis->auth($this->getAuth()));
+
+        $redis->del('pipeline-hash-read');
+        $redis->close();
+    }
+
     public function testDeferredReplyDisconnectCleanup() {
         $class = $this->getRedisClass();
         if ( ! is_a($class, Redis::class, true))
@@ -4619,6 +4671,11 @@ class Redis_Test extends TestSuite {
                                 if (is_resource($peer))
                                     fclose($peer);
                                 unset($redis);
+                                /* The disconnect hands the hash read's reply to
+                                   the reply loop, which releases it before the
+                                   context; nothing freed may stay in the GC root
+                                   buffer. */
+                                gc_collect_cycles();
                             }
                         }
                     }
@@ -7446,6 +7503,74 @@ class Redis_Test extends TestSuite {
         $this->assertFalse(in_array($client->client('id'), $ids));
         $this->assertNotEquals('must-not-be-reused', $client->client('getname'));
         $client->close();
+    }
+
+    /* A blocking read on $key must give up after a read timeout of 1 second */
+    protected function assertReadTimesOut($client, string $key) {
+        $startTime = microtime(true);
+        $this->assertThrowsMatch($client, function ($client) use ($key) {
+            $client->blPop([$key], 4);
+        });
+        $this->assertLT(2.5, microtime(true) - $startTime);
+    }
+
+    private function newPersistentInstance(float $read_timeout, $persistent = true) {
+        $class = $this->getRedisClass();
+        $redis = new $class(['host' => $this->getHost(), 'port' => $this->getPort(),
+                             'persistent' => $persistent, 'readTimeout' => $read_timeout]);
+        if ($this->getAuth())
+            $this->assertTrue($redis->auth($this->getAuth()));
+        $this->assertTrue($redis->ping());
+
+        return $redis;
+    }
+
+    /* A pooled connection must use the read timeout of the object taking it,
+       not the one of its last user. */
+    public function testPooledReadTimeout() {
+        if (!ini_get('redis.pconnect.pooling_enabled'))
+            $this->markTestSkipped('Requires connection pooling');
+
+        $key = uniqid('pooled-read-timeout:', true);
+
+        /* Freeing the object hands its connection back to the pool */
+        $first = $this->newPersistentInstance(5);
+        unset($first);
+
+        $second = $this->newPersistentInstance(1);
+        $this->assertReadTimesOut($second, $key);
+
+        /* Zero means default_socket_timeout, as it does for a new connection */
+        $this->assertTrue($second->ping());
+        $this->assertTrue($second->setOption(Redis::OPT_READ_TIMEOUT, 0));
+        $this->assertTrue($second->ping());
+        $second->close();
+    }
+
+    /* Without pooling, PHP hands back the open stream of the same persistent ID,
+       and a read timeout of 0 must still mean default_socket_timeout. */
+    public function testPersistentReadTimeoutWithoutPool() {
+        $pooling = ini_get('redis.pconnect.pooling_enabled');
+        $socket_timeout = ini_get('default_socket_timeout');
+        $key = uniqid('persistent-read-timeout:', true);
+        $id = uniqid('persistent-read-timeout-', true);
+
+        ini_set('redis.pconnect.pooling_enabled', '0');
+        ini_set('default_socket_timeout', '1');
+        try {
+            /* Freeing the object leaves its stream open for the same ID */
+            $first = $this->newPersistentInstance(5, $id);
+            $client_id = $first->client('id');
+            unset($first);
+
+            $second = $this->newPersistentInstance(0, $id);
+            $this->assertEquals($client_id, $second->client('id'));
+            $this->assertReadTimesOut($second, $key);
+            $second->close();
+        } finally {
+            ini_set('redis.pconnect.pooling_enabled', $pooling);
+            ini_set('default_socket_timeout', $socket_timeout);
+        }
     }
 
     public function testReconnectFailure() {
@@ -10413,9 +10538,10 @@ class Redis_Test extends TestSuite {
 
         $obj = new class() {};
 
+        /* PHP versions differ in how anonymous classes are named in exceptions. */
         $this->assertThrowsMatch(null, function () use ($obj) {
             $this->redis->set('payload', $obj);
-        }, "/Serialization of 'class@anonymous' is not allowed/");
+        });
 
         /* Ensure extension remains stable after failure */
         $this->assertTrue($this->redis->set('after_failure', 'ok'));

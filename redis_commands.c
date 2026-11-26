@@ -1137,6 +1137,10 @@ redis_fcall_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock, const char 
         } ZEND_HASH_FOREACH_END();
     }
 
+    /* No keys, so pick a random slot */
+    if (cmd->slot == -1)
+        redis_cmd_randslot(cmd);
+
     return cmd;
 }
 
@@ -3054,11 +3058,11 @@ static void redis_cmd_cat_hash_fields(RedisCmd *cmd, HashTable *ht) {
 void redis_cmd_ctx_hash_dtor(void *ptr) {
     HashTable *ht = ptr;
 
-    if (GC_REFCOUNT(ht) == 1) {
-        zend_hash_destroy(ht);
-        FREE_HASHTABLE(ht);
-    } else {
-        GC_DELREF(ht);
+    /* The reply loops hand this table out as the reply, which may have been
+     * released already and left the table in the GC root buffer.
+     * zend_array_destroy() takes it out of the buffer before freeing it. */
+    if (GC_DELREF(ht) == 0) {
+        zend_array_destroy(ht);
     }
 }
 
@@ -7540,7 +7544,6 @@ void redis_setoption_handler(INTERNAL_FUNCTION_PARAMETERS,
     zend_long val_long, option;
     zval *val;
     zend_string *val_str;
-    struct timeval read_tv;
     int tcp_keepalive = 0;
     const php_netstream_data_t *sock;
 
@@ -7614,15 +7617,8 @@ void redis_setoption_handler(INTERNAL_FUNCTION_PARAMETERS,
             }
             RETURN_TRUE;
         case REDIS_OPT_READ_TIMEOUT:
-            redis_sock->read_timeout = zval_get_double(val);
-            if (redis_sock->stream) {
-                read_tv.tv_sec  = (time_t)redis_sock->read_timeout;
-                read_tv.tv_usec = (int)((redis_sock->read_timeout -
-                                         read_tv.tv_sec) * 1000000);
-                php_stream_set_option(redis_sock->stream,
-                                      PHP_STREAM_OPTION_READ_TIMEOUT, 0,
-                                      &read_tv);
-            }
+            redis_sock_set_read_timeout(redis_sock, zval_get_double(val));
+            if (c) cluster_set_read_timeout(c);
             RETURN_TRUE;
         case REDIS_OPT_TCP_KEEPALIVE:
 

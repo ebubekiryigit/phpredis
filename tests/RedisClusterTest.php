@@ -242,6 +242,7 @@ class Redis_Cluster_Test extends Redis_Test {
     public function testInvalidAuthArgs() { $this->markTestSkipped(); }
     public function testScanErrors() { $this->markTestSkipped(); }
     public function testConnectDatabaseSelect() { $this->markTestSkipped(); }
+    public function testPersistentReadTimeoutWithoutPool() { $this->markTestSkipped(); }
     /* BLESS SCAN cursors are per node, so RedisCluster needs a key or node */
     protected function blessScan(?string $directive, ?array $options = null, $node = 'bless') {
         return $this->redis->bless('SCAN', null, $directive, $options, $node);
@@ -279,6 +280,51 @@ class Redis_Cluster_Test extends Redis_Test {
         foreach ($masters as $i => $node)
             $this->assertFalse(in_array($client->rawCommand($node, 'CLIENT', 'ID'), $ids[$i]));
         $client->close();
+    }
+
+    /* A pooled node connection must use the read timeout of the object taking
+     * it, not the one of its last user. */
+    public function testPooledReadTimeout() {
+        if (!ini_get('redis.pconnect.pooling_enabled'))
+            $this->markTestSkipped('Requires connection pooling');
+
+        $key = uniqid('pooled-read-timeout:', true);
+        $class = $this->getRedisClusterClass();
+
+        /* Freeing the object hands every node connection back to the pool */
+        $first = new $class(NULL, self::$seeds, 5, 5, true, $this->getAuth());
+        foreach ($first->_masters() as $master)
+            $this->assertTrue($first->ping($master));
+        unset($first);
+
+        $second = new $class(NULL, self::$seeds, 5, 1, true, $this->getAuth());
+        try {
+            $this->assertReadTimesOut($second, $key);
+        } finally {
+            $second->close();
+        }
+    }
+
+    /* OPT_READ_TIMEOUT must reach node connections that are already open */
+    public function testReadTimeoutOpenConnections() {
+        $key = uniqid('read-timeout:', true);
+        $class = $this->getRedisClusterClass();
+        $client = new $class(NULL, self::$seeds, 5, 5, false, $this->getAuth());
+        try {
+            foreach ($client->_masters() as $master)
+                $this->assertTrue($client->ping($master));
+
+            $this->assertTrue($client->setOption(Redis::OPT_READ_TIMEOUT, 1));
+            $this->assertEquals(1.0, $client->getOption(Redis::OPT_READ_TIMEOUT));
+            $this->assertReadTimesOut($client, $key);
+
+            /* Zero means default_socket_timeout, as it does for a new connection */
+            $this->assertTrue($client->setOption(Redis::OPT_READ_TIMEOUT, 0));
+            foreach ($client->_masters() as $master)
+                $this->assertTrue($client->ping($master));
+        } finally {
+            $client->close();
+        }
     }
 
     public function testReconnect() {
@@ -366,7 +412,6 @@ class Redis_Cluster_Test extends Redis_Test {
     /* These 'directed node' commands work differently in RedisCluster */
     public function testConfig() { $this->markTestSkipped(); }
     public function testFlushDB() { $this->markTestSkipped(); }
-    public function testFunction() { $this->markTestSkipped(); }
 
     /* Session locking is currently not supported in RedisCluster.
        The biggest issue is the distributed nature of Redis Cluster. */
@@ -4732,6 +4777,105 @@ class Redis_Cluster_Test extends Redis_Test {
         $this->assertNull($result[0]);
     }
 
+    private function requireFunctions() {
+        if ($this->is_dragonfly)
+            $this->markTestSkipped('Dragonfly does not support Redis function libraries');
+
+        if ( ! $this->minVersionCheck('7.0') || ! $this->haveCommand('FUNCTION'))
+            $this->markTestSkipped();
+    }
+
+    /* RedisCluster has no FUNCTION method, so load the library on every master
+     * through rawCommand() */
+    private function loadFunctionLibrary(string $name, string $body) {
+        foreach ($this->redis->_masters() as $master) {
+            $this->assertEquals($name, $this->redis->rawCommand($master, 'FUNCTION', 'LOAD',
+                                                               'REPLACE', "#!lua name=$name\n$body"));
+        }
+    }
+
+    private function deleteFunctionLibrary(string $name) {
+        foreach ($this->redis->_masters() as $master)
+            $this->redis->rawCommand($master, 'FUNCTION', 'DELETE', $name);
+    }
+
+    /* FCALL and FCALL_RO are routed by their first key, or to any node when
+     * they have none */
+    public function testFunction() {
+        $this->requireFunctions();
+
+        $keys = [];
+        for ($i = 0; $i < 10; $i++)
+            $keys[] = uniqid("fcall:$i:", true);
+
+        try {
+            $this->loadFunctionLibrary('phpredis_test_fcall',
+                "redis.register_function('phpredis_test_fcall_get', " .
+                "function(keys) return redis.call('GET', keys[1]) end)\n" .
+                "redis.register_function{function_name='phpredis_test_fcall_get_ro', flags={'no-writes'}, " .
+                "callback=function(keys) return redis.call('GET', keys[1]) end}\n" .
+                "redis.register_function{function_name='phpredis_test_fcall_echo', flags={'no-writes'}, " .
+                "callback=function(keys, args) return args[1] end}");
+
+            foreach ($keys as $key) {
+                $this->assertTrue($this->redis->set($key, "value:$key"));
+                $this->assertEquals("value:$key", $this->redis->fcall('phpredis_test_fcall_get', [$key]));
+                $this->assertEquals("value:$key", $this->redis->fcall_ro('phpredis_test_fcall_get_ro', [$key]));
+            }
+
+            $this->assertEquals('foo', $this->redis->fcall('phpredis_test_fcall_echo', [], ['foo']));
+            $this->assertEquals('foo', $this->redis->fcall_ro('phpredis_test_fcall_echo', [], ['foo']));
+            $this->assertFalse(@$this->redis->fcall('phpredis_test_fcall_get', ['{a}:key', '{b}:key']));
+        } finally {
+            $this->redis->del($keys);
+            $this->deleteFunctionLibrary('phpredis_test_fcall');
+        }
+    }
+
+    /* FCALL_RO may be served by a replica, FCALL never is */
+    public function testFunctionReadonlyRouting() {
+        $this->requireFunctions();
+
+        $key = '{fcall-ro-routing}:key';
+        if ( ! ($replicas = $this->replicasForKey($key)))
+            $this->markTestSkipped('Requires replicas');
+
+        $nodes = array_map([$this, 'connectToNode'], $replicas);
+        $calls = function (string $command) use ($nodes) {
+            $count = 0;
+            foreach ($nodes as $node) {
+                $stats = $node->info('commandstats');
+                if (preg_match('/calls=(\d+)/', $stats["cmdstat_$command"] ?? '', $match))
+                    $count += (int)$match[1];
+            }
+            return $count;
+        };
+
+        $previous = $this->redis->getOption(RedisCluster::OPT_SLAVE_FAILOVER);
+        try {
+            $this->loadFunctionLibrary('phpredis_test_fcall_ro',
+                "redis.register_function{function_name='phpredis_test_fcall_peek', flags={'no-writes'}, " .
+                "callback=function(keys) return redis.call('GET', keys[1]) end}");
+
+            /* The library and the value reach the replicas asynchronously */
+            $this->assertTrue($this->redis->set($key, 'value'));
+            $this->assertEquals(count($replicas),
+                $this->redis->rawCommand($key, 'WAIT', count($replicas), 1000));
+
+            $this->redis->setOption(RedisCluster::OPT_SLAVE_FAILOVER,
+                                    RedisCluster::FAILOVER_DISTRIBUTE_SLAVES);
+            $before = [$calls('fcall_ro'), $calls('fcall')];
+            $this->assertEquals('value', $this->redis->fcall_ro('phpredis_test_fcall_peek', [$key]));
+            $this->assertEquals('value', $this->redis->fcall('phpredis_test_fcall_peek', [$key]));
+            $this->assertEquals([$before[0] + 1, $before[1]], [$calls('fcall_ro'), $calls('fcall')]);
+        } finally {
+            $this->redis->setOption(RedisCluster::OPT_SLAVE_FAILOVER, $previous);
+            $this->redis->del($key);
+            $this->deleteFunctionLibrary('phpredis_test_fcall_ro');
+            foreach ($nodes as $node) $node->close();
+        }
+    }
+
     /* Cluster specific introspection stuff */
     public function testIntrospection() {
         $primaries = $this->redis->_masters();
@@ -4891,6 +5035,95 @@ class Redis_Cluster_Test extends Redis_Test {
         $this->redis->del('mylist');
         $this->redis->rpush('mylist', 'A', 'B', 'C', 'D');
         $this->assertEquals(['A', 'B', 'C', 'D'], $this->redis->lrange('mylist', 0, -1));
+    }
+
+    public function testRawCommandRouting() {
+        $key = '{raw-command-routing}:key';
+        if (!($replicas = $this->replicasForKey($key)))
+            $this->markTestSkipped('Requires replicas');
+
+        $nodes = array_map([$this, 'connectToNode'], $replicas);
+        $primaryId = $this->redis->rawCommand($key, 'CLUSTER', 'MYID');
+        $primary = null;
+        foreach ($this->redis->_masters() as $master) {
+            if ($this->redis->rawCommand($master, 'CLUSTER', 'MYID') === $primaryId) {
+                $primary = $master;
+                break;
+            }
+        }
+        $this->assertIsArray($primary);
+        $getCount = function () use ($nodes) {
+            $count = 0;
+            foreach ($nodes as $node) {
+                $stats = $node->info('commandstats');
+                if (preg_match('/calls=(\d+)/', $stats['cmdstat_get'] ?? '', $match))
+                    $count += (int)$match[1];
+            }
+            return $count;
+        };
+
+        $previous = $this->redis->getOption(RedisCluster::OPT_SLAVE_FAILOVER);
+        try {
+            foreach ([RedisCluster::FAILOVER_NONE, RedisCluster::FAILOVER_ERROR,
+                      RedisCluster::FAILOVER_DISTRIBUTE,
+                      RedisCluster::FAILOVER_DISTRIBUTE_SLAVES] as $mode) {
+                $this->redis->setOption(RedisCluster::OPT_SLAVE_FAILOVER, $mode);
+                foreach ([$key, $primary] as $target) {
+                    foreach ([false, true] as $precedingRead) {
+                        $this->assertTrue($this->redis->set($key, 'value'));
+                        $this->assertEquals(count($replicas),
+                            $this->redis->rawCommand($key, 'WAIT', count($replicas), 1000));
+                        if ($precedingRead) $this->redis->get($key);
+
+                        $before = $getCount();
+                        $this->assertEquals('value', $this->redis->rawCommand($target, 'gEt', $key));
+                        $reads = $getCount() - $before;
+                        if ($mode === RedisCluster::FAILOVER_DISTRIBUTE_SLAVES) {
+                            $this->assertEquals(1, $reads);
+                        } elseif ($mode === RedisCluster::FAILOVER_DISTRIBUTE) {
+                            $this->assertTrue($reads === 0 || $reads === 1);
+                        } else {
+                            $this->assertEquals(0, $reads);
+                        }
+
+                        /* A raw read must not make a subsequent raw write readonly. */
+                        $this->assertTrue($this->redis->rawCommand($target, 'SET', $key, 'updated'));
+                        $this->redis->get($key);
+                        $this->assertTrue($this->redis->rawCommand($target, 'SET', $key, 'value'));
+                        if ($this->minVersionCheck('6.2.0')) {
+                            $this->redis->get($key);
+                            $this->assertEquals('value', $this->redis->rawCommand($target, 'GETDEL', $key));
+                        }
+
+                        /* ROLE is deliberately outside the readonly allowlist. */
+                        $this->redis->get($key);
+                        $role = $this->redis->rawCommand($target, 'ROLE');
+                        $this->assertEquals('master', $role[0]);
+
+                        /* Named node-directed commands must not inherit it either. */
+                        $this->redis->get($key);
+                        $this->assertEquals('master', $this->redis->role($target)[0]);
+                        $this->redis->get($key);
+                        $this->assertEquals($primaryId, $this->redis->cluster($target, 'MYID'));
+                    }
+                }
+            }
+
+            /* MULTI must use the primary even for a recognized readonly command. */
+            $this->redis->set($key, 'transaction');
+            $this->redis->get($key);
+            $before = $getCount();
+            $this->redis->multi();
+            $this->redis->rawCommand($key, 'GET', $key);
+            $this->redis->rawCommand($key, 'SET', $key, 'after');
+            $this->assertEquals(['transaction', true], $this->redis->exec());
+            $this->assertEquals($before, $getCount());
+        } finally {
+            if ($this->redis->getMode() === Redis::MULTI) $this->redis->discard();
+            $this->redis->setOption(RedisCluster::OPT_SLAVE_FAILOVER, $previous);
+            $this->redis->del($key);
+            foreach ($nodes as $node) $node->close();
+        }
     }
 
     protected function rawCommandArray($key, $args) {
